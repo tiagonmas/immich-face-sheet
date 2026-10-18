@@ -12,11 +12,33 @@ env/
 .env.*
 !.env.example
 
-# Generated face sheets
-face-sheet*.jpg
-*_faces.jpg
-*_collage.jpg
-*_photomosaic.jpg
+# Image files, except files in the assets folder
+*.[pP][nN][gG]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[jJ][pP][eE]
+*.[gG][iI][fF]
+*.[bB][mM][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[wW][eE][bB][pP]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.[aA][vV][iI][fF]
+*.[sS][vV][gG]
+*.[iI][cC][oO]
+*.[iI][cC][nN][sS]
+*.[pP][sS][dD]
+*.[xX][cC][fF]
+*.[jJ][pP]2
+*.[dD][nN][gG]
+*.[cC][rR]2
+*.[nN][eE][fF]
+*.[aA][rR][wW]
+!assets/
+!assets/**
+
+# Generated face crops and cache
 _crops/
 
 # Local/editor files

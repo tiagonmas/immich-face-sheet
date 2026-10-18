@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
+import hashlib
 from io import BytesIO
+import json
 from pathlib import Path
 import os
 import sys
@@ -199,6 +201,51 @@ def crop_face(api_root: str, asset: dict[str, Any], face: dict[str, Any], api_ke
         return image.crop((left, top, right, bottom)).copy()
 
 
+def crop_cache_path(
+    cache_directory: Path, api_root: str, person_id: str,
+    asset: dict[str, Any], face: dict[str, Any],
+) -> Path:
+    identity = {
+        "server": api_root.rstrip("/"),
+        "person_id": person_id,
+        "asset_id": asset.get("id"),
+        "asset_checksum": asset.get("checksum"),
+        "asset_updated_at": asset.get("updatedAt") or asset.get("fileModifiedAt"),
+        "face_id": face.get("id"),
+        "face_box": [
+            face.get("boundingBoxX1"), face.get("boundingBoxY1"),
+            face.get("boundingBoxX2"), face.get("boundingBoxY2"),
+            face.get("imageWidth"), face.get("imageHeight"),
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return cache_directory / f"{digest}.jpg"
+
+
+def cached_or_fetch_crop(
+    api_root: str, person_id: str, asset: dict[str, Any], face: dict[str, Any],
+    api_key: str, cache_directory: Path, force_fetch: bool,
+) -> tuple[Image.Image, bool]:
+    """Load a cached face crop or fetch it and update the local cache."""
+    cache_path = crop_cache_path(cache_directory, api_root, person_id, asset, face)
+    if cache_path.is_file() and not force_fetch:
+        try:
+            with Image.open(cache_path) as cached:
+                return ImageOps.exif_transpose(cached).convert("RGB").copy(), True
+        except Exception:
+            # A truncated or unsupported cache entry is refreshed from Immich.
+            pass
+
+    crop = crop_face(api_root, asset, face, api_key)
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_name(f"{cache_path.stem}.{threading.get_ident()}.tmp.jpg")
+    crop.save(temporary_path, format="JPEG", quality=95, optimize=True)
+    temporary_path.replace(cache_path)
+    return crop, False
+
+
 def label_for(asset: dict[str, Any], index: int, include_metadata: bool) -> str:
     if not include_metadata:
         return ""
@@ -362,6 +409,63 @@ def photomosaic_grid(source: Image.Image, face_size: int) -> tuple[int, int]:
     return columns, rows
 
 
+def minimum_photomosaic_tile_size(source: Image.Image, face_count: int) -> int:
+    """Find the smallest tile size whose grid does not exceed the available crops."""
+    low, high = 1, max(source.width, source.height)
+    while low < high:
+        candidate = (low + high) // 2
+        columns, rows = photomosaic_grid(source, candidate)
+        if columns * rows <= face_count:
+            high = candidate
+        else:
+            low = candidate + 1
+    return low
+
+
+def choose_photomosaic_tile_size(
+    source: Image.Image, face_count: int, requested_size: int | None
+) -> int | None:
+    minimum_size = minimum_photomosaic_tile_size(source, face_count)
+    columns, rows = photomosaic_grid(source, minimum_size)
+    print(
+        f"Found {face_count:,} face crops. The smallest tile size that keeps the "
+        f"photomosaic grid within that count is {minimum_size}px "
+        f"({columns * rows:,} tiles). Smaller tiles create more tiles than available "
+        "face crops, so some faces may need to repeat.",
+        flush=True,
+    )
+    if requested_size is not None:
+        return requested_size
+
+    while True:
+        try:
+            answer = input(
+                f"Photomosaic tile size in pixels [{minimum_size}] (or q to cancel): "
+            ).strip()
+        except EOFError:
+            raise RuntimeError(
+                "No interactive input is available; pass --photomosaic-tile-size PIXELS."
+            )
+        if answer.casefold() == "q":
+            return None
+        if not answer:
+            return minimum_size
+        try:
+            size = int(answer)
+        except ValueError:
+            print("Enter a whole number of pixels, or q to cancel.")
+            continue
+        if size < 1:
+            print("Tile size must be at least 1 pixel.")
+            continue
+        if size < minimum_size:
+            print(
+                f"That size creates more than {face_count:,} tiles, so some face crops "
+                "will be reused."
+            )
+        return size
+
+
 def validate_photomosaic_dimensions(source: Image.Image, face_size: int, spacing: int) -> tuple[int, int]:
     columns, rows = photomosaic_grid(source, face_size)
     width = columns * face_size + max(0, columns - 1) * spacing
@@ -370,7 +474,7 @@ def validate_photomosaic_dimensions(source: Image.Image, face_size: int, spacing
         raise RuntimeError(
             f"The photomosaic would be {width} x {height} pixels, exceeding Pillow's "
             f"{MAX_IMAGE_DIMENSION}-pixel limit per dimension. Use a smaller input image, "
-            "reduce --face-size, or reduce --face-spacing."
+            "reduce --photomosaic-tile-size, or reduce --face-spacing."
         )
     return width, height
 
@@ -396,13 +500,16 @@ def build_photomosaic(
 
     mosaic = Image.new("RGB", (width, height), "#202124")
     usage = [0] * len(tiles)
+    unused = set(range(len(tiles))) if len(target_pixels) <= len(tiles) else set()
     previous_row: list[int] = []
     for index, target_color in enumerate(target_pixels):
         x_index, y_index = index % columns, index // columns
         best_candidate = 0
         best_score: int | None = None
         left_candidate = previous_row[x_index - 1] if x_index > 0 else None
-        for candidate, color in enumerate(colors):
+        candidates = unused if unused else range(len(colors))
+        for candidate in candidates:
+            color = colors[candidate]
             red = target_color[0] - color[0]
             green = target_color[1] - color[1]
             blue = target_color[2] - color[2]
@@ -416,6 +523,7 @@ def build_photomosaic(
         y = y_index * (face_size + spacing)
         mosaic.paste(tiles[best_candidate], (x, y))
         usage[best_candidate] += 1
+        unused.discard(best_candidate)
         if x_index == 0:
             previous_row = []
         previous_row.append(best_candidate)
@@ -489,6 +597,10 @@ def main() -> int:
         help="Face tile width and height in pixels (default: 112; --tile-size is an alias)",
     )
     parser.add_argument(
+        "--photomosaic-tile-size", type=int, metavar="PIXELS",
+        help="Photomosaic tile size; if omitted, calculate a minimum and prompt for a choice",
+    )
+    parser.add_argument(
         "--include-metadata", action="store_true",
         help="Show source filename and date below each face (metadata is omitted by default)",
     )
@@ -499,6 +611,10 @@ def main() -> int:
     parser.add_argument(
         "--save-crops", action="store_true",
         help="Save individual face crops in the local _crops/ folder (off by default)",
+    )
+    parser.add_argument(
+        "--force-fetch", action="store_true",
+        help="Fetch face previews again instead of reusing cached crops, then refresh the cache",
     )
     parser.add_argument(
         "--photomosaic-image", metavar="PATH",
@@ -523,6 +639,10 @@ def main() -> int:
         parser.error("--photomosaic-image is required when --mode photomosaic is selected")
     if args.mode != "photomosaic" and args.photomosaic_image:
         parser.error("--photomosaic-image can only be used with --mode photomosaic")
+    if args.mode != "photomosaic" and args.photomosaic_tile_size is not None:
+        parser.error("--photomosaic-tile-size can only be used with --mode photomosaic")
+    if args.photomosaic_tile_size is not None and args.photomosaic_tile_size < 1:
+        parser.error("photomosaic-tile-size must be at least 1 pixel")
     if args.mode != "contact-sheet" and args.include_metadata:
         parser.error("--include-metadata can only be used with --mode contact-sheet")
 
@@ -536,11 +656,13 @@ def main() -> int:
                 photomosaic_source = ImageOps.exif_transpose(source_file).convert("RGB")
         except Exception as exc:
             parser.error(f"could not open photomosaic input image {source_path}: {exc}")
-        try:
-            validate_photomosaic_dimensions(photomosaic_source, args.tile_size, args.face_spacing)
-        except RuntimeError as exc:
-            parser.error(str(exc))
-
+        if args.photomosaic_tile_size is not None:
+            try:
+                validate_photomosaic_dimensions(
+                    photomosaic_source, args.photomosaic_tile_size, args.face_spacing
+                )
+            except RuntimeError as exc:
+                parser.error(str(exc))
     default_outputs = {
         "contact-sheet": "face-sheet.jpg",
         "collage": "face-collage.jpg",
@@ -569,11 +691,24 @@ def main() -> int:
     print(f"  Immich server: {base_url}", flush=True)
     print(f"  Person name: {args.person_name}", flush=True)
     print(f"  Output file: {output}", flush=True)
-    print(f"  Faces per row: {args.columns}", flush=True)
-    print(f"  Face size: {args.tile_size} x {args.tile_size} pixels", flush=True)
+    if args.mode == "photomosaic":
+        tile_setting = (
+            f"{args.photomosaic_tile_size} pixels"
+            if args.photomosaic_tile_size is not None else "choose after finding face crops"
+        )
+        print(f"  Photomosaic tile size: {tile_setting}", flush=True)
+    else:
+        print(f"  Faces per row: {args.columns}", flush=True)
+        print(f"  Face size: {args.tile_size} x {args.tile_size} pixels", flush=True)
     print(f"  Space between faces: {args.face_spacing} pixels", flush=True)
     print(f"  Maximum faces: {args.max_faces if args.max_faces is not None else 'all'}", flush=True)
-    print(f"  Metadata: {'included' if args.include_metadata else 'omitted'}", flush=True)
+    print(
+        "  Crop cache: "
+        + ("refresh from Immich" if args.force_fetch else "reuse local crops when available"),
+        flush=True,
+    )
+    if args.mode == "contact-sheet":
+        print(f"  Metadata: {'included' if args.include_metadata else 'omitted'}", flush=True)
     print(f"  Save individual crops: {'yes (_crops/)' if args.save_crops else 'no'}", flush=True)
     if photomosaic_source is not None:
         print(f"  Photomosaic target: {args.photomosaic_image}", flush=True)
@@ -610,12 +745,20 @@ def main() -> int:
                 args.face_spacing, args.include_metadata,
             )
         crops: list[tuple[Image.Image, str]] = []
+        cache_hits = 0
         errors = 0
+        cache_directory = Path.cwd() / "_crops" / "cache"
 
-        def process(asset: dict[str, Any]) -> list[tuple[Image.Image, str]]:
+        def process(asset: dict[str, Any]) -> list[tuple[Image.Image, bool, str]]:
             faces = faces_for_asset(api_root, asset, person_id, api_key)
             return [
-                (crop_face(api_root, asset, face, api_key), label_for(asset, len(faces), args.include_metadata))
+                (
+                    *cached_or_fetch_crop(
+                        api_root, person_id, asset, face, api_key,
+                        cache_directory, args.force_fetch,
+                    ),
+                    label_for(asset, len(faces), args.include_metadata),
+                )
                 for face in faces
             ]
 
@@ -630,10 +773,11 @@ def main() -> int:
                 for asset, future in zip(batch, futures):
                     try:
                         result = future.result()
-                        for crop, _label in result:
+                        for crop, was_cached, _label in result:
                             crops.append((crop, label_for(
                                 asset, len(crops) + 1, args.include_metadata
                             )))
+                            cache_hits += int(was_cached)
                             if args.max_faces is not None and len(crops) >= args.max_faces:
                                 break
                     except Exception as exc:
@@ -648,6 +792,25 @@ def main() -> int:
                         break
             if args.max_faces is not None and len(crops) >= args.max_faces:
                 break
+
+        print(
+            f"Reused {cache_hits} cached face crops; fetched {len(crops) - cache_hits} new previews.",
+            flush=True,
+        )
+
+        photomosaic_tile_size = None
+        if args.mode == "photomosaic":
+            if not crops:
+                raise RuntimeError("No face crops were found for the photomosaic.")
+            photomosaic_tile_size = choose_photomosaic_tile_size(
+                photomosaic_source, len(crops), args.photomosaic_tile_size
+            )
+            if photomosaic_tile_size is None:
+                print("Photomosaic cancelled; no output was written.")
+                return 1
+            validate_photomosaic_dimensions(
+                photomosaic_source, photomosaic_tile_size, args.face_spacing
+            )
 
         if args.save_crops:
             crop_directory = Path.cwd() / "_crops"
@@ -664,7 +827,7 @@ def main() -> int:
         else:
             build_photomosaic(
                 crops, photomosaic_source, output,
-                args.tile_size, args.face_spacing,
+                photomosaic_tile_size, args.face_spacing,
             )
         print(f"Saved {len(crops)} face crops for {person_name} to {output.resolve()}")
         if errors:
