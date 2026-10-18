@@ -15,6 +15,7 @@ env/
 # Generated face sheets
 face-sheet*.jpg
 *_faces.jpg
+*_collage.jpg
 _crops/
 
 # Local/editor files

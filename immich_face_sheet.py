@@ -25,6 +25,7 @@ except ImportError as exc:
 
 
 THREAD_LOCAL = threading.local()
+MAX_IMAGE_DIMENSION = 65500
 
 
 def session_for_thread(api_key: str) -> requests.Session:
@@ -206,17 +207,40 @@ def label_for(asset: dict[str, Any], index: int, include_metadata: bool) -> str:
     return f"{index:04d} {date}\n{name}"
 
 
+def sheet_dimensions(
+    face_count: int, columns: int, tile: int, spacing: int, include_metadata: bool
+) -> tuple[int, int]:
+    label_height = 30 if include_metadata else 0
+    cell_height = tile + label_height
+    rows = (face_count + columns - 1) // columns
+    width = columns * tile + max(0, columns - 1) * spacing
+    height = rows * cell_height + max(0, rows - 1) * spacing
+    return width, height
+
+
+def validate_sheet_dimensions(
+    face_count: int, columns: int, tile: int, spacing: int, include_metadata: bool
+) -> None:
+    width, height = sheet_dimensions(face_count, columns, tile, spacing, include_metadata)
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise RuntimeError(
+            f"The contact sheet would be {width} x {height} pixels, exceeding Pillow's "
+            f"{MAX_IMAGE_DIMENSION}-pixel limit per dimension. Reduce --max-faces or "
+            "--face-size, or increase --faces-per-row."
+        )
+
+
 def build_sheet(
     crops: list[tuple[Image.Image, str]], output: Path, columns: int, tile: int,
     spacing: int, include_metadata: bool,
 ) -> None:
     if not crops:
         raise RuntimeError("No face crops were found for that person.")
+    validate_sheet_dimensions(len(crops), columns, tile, spacing, include_metadata)
     label_height = 30 if include_metadata else 0
     cell_height = tile + label_height
     rows = (len(crops) + columns - 1) // columns
-    width = columns * tile + max(0, columns - 1) * spacing
-    height = rows * cell_height + max(0, rows - 1) * spacing
+    width, height = sheet_dimensions(len(crops), columns, tile, spacing, include_metadata)
     sheet = Image.new("RGB", (width, height), "#202124")
     draw = ImageDraw.Draw(sheet)
     try:
@@ -232,6 +256,42 @@ def build_sheet(
             draw.multiline_text((x + 2, y + tile), label[:90], fill="white", font=font, spacing=1)
     output.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(output, quality=92, optimize=True)
+
+
+def build_collage(
+    crops: list[tuple[Image.Image, str]], output: Path, columns: int,
+    face_size: int, spacing: int,
+) -> None:
+    """Make a compact masonry-style collage, preserving each crop's aspect ratio."""
+    if not crops:
+        raise RuntimeError("No face crops were found for the collage.")
+
+    scaled = [
+        ImageOps.contain(crop, (face_size, face_size), Image.Resampling.LANCZOS)
+        for crop, _label in crops
+    ]
+    rows = [scaled[i:i + columns] for i in range(0, len(scaled), columns)]
+    row_widths = [sum(image.width for image in row) + spacing * (len(row) - 1) for row in rows]
+    row_heights = [max(image.height for image in row) for row in rows]
+    width = max(row_widths)
+    height = sum(row_heights) + spacing * (len(rows) - 1)
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise RuntimeError(
+            f"The collage would be {width} x {height} pixels, exceeding Pillow's "
+            f"{MAX_IMAGE_DIMENSION}-pixel limit per dimension. Reduce --max-faces or "
+            "--face-size, or increase --faces-per-row."
+        )
+
+    collage = Image.new("RGB", (width, height), "#202124")
+    y = 0
+    for row, row_width, row_height in zip(rows, row_widths, row_heights):
+        x = (width - row_width) // 2
+        for image in row:
+            collage.paste(image, (x, y + (row_height - image.height) // 2))
+            x += image.width + spacing
+        y += row_height + spacing
+    output.parent.mkdir(parents=True, exist_ok=True)
+    collage.save(output, quality=92, optimize=True)
 
 
 def save_crops(crops: list[tuple[Image.Image, str]], directory: Path) -> None:
@@ -306,6 +366,10 @@ def main() -> int:
         help="Save individual face crops in the local _crops/ folder (off by default)",
     )
     parser.add_argument(
+        "--create-collage", action="store_true",
+        help="Also create a compact collage beside the contact sheet (off by default)",
+    )
+    parser.add_argument(
         "--max-faces", type=int, default=None,
         help="Maximum face crops to include; by default include all faces found",
     )
@@ -325,6 +389,13 @@ def main() -> int:
     if output is None:
         print("Output cancelled; no file was written.")
         return 1
+    collage_output = None
+    if args.create_collage:
+        collage_output = output.with_name(f"{output.stem}_collage.jpg")
+        collage_output = confirm_output_path(str(collage_output))
+        if collage_output is None:
+            print("Collage output cancelled; no file was written.")
+            return 1
 
     base_url = args.base_url.rstrip("/")
     api_root = f"{base_url}/api"
@@ -347,6 +418,7 @@ def main() -> int:
     print(f"  Maximum faces: {args.max_faces if args.max_faces is not None else 'all'}", flush=True)
     print(f"  Metadata: {'included' if args.include_metadata else 'omitted'}", flush=True)
     print(f"  Save individual crops: {'yes (_crops/)' if args.save_crops else 'no'}", flush=True)
+    print(f"  Create collage: {'yes (' + str(collage_output) + ')' if args.create_collage else 'no'}", flush=True)
     print(f"  Concurrent requests: {args.workers}", flush=True)
     print("  API key: provided (value hidden)", flush=True)
 
@@ -372,6 +444,12 @@ def main() -> int:
         assets = fetch_assets(api_root, person_id, api_key)
         if not assets:
             raise RuntimeError("Immich returned no matching assets. Check the person ID and API key permissions.")
+
+        estimated_faces = min(args.max_faces, len(assets)) if args.max_faces is not None else len(assets)
+        validate_sheet_dimensions(
+            estimated_faces, args.columns, args.tile_size,
+            args.face_spacing, args.include_metadata,
+        )
 
         crops: list[tuple[Image.Image, str]] = []
         errors = 0
@@ -422,6 +500,9 @@ def main() -> int:
             crops, output, args.columns, args.tile_size,
             args.face_spacing, args.include_metadata,
         )
+        if args.create_collage and collage_output is not None:
+            build_collage(crops, collage_output, args.columns, args.tile_size, args.face_spacing)
+            print(f"Saved collage to {collage_output.resolve()}", flush=True)
         print(f"Saved {len(crops)} face crops for {person_name} to {output.resolve()}")
         if errors:
             print(f"Skipped {errors} assets because Immich returned an error for them.", file=sys.stderr)

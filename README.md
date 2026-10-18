@@ -48,6 +48,8 @@ The output path is relative to the directory where you run the command, unless y
 If that file already exists, the script asks whether to overwrite it. If you decline, it asks for a different filename; enter `q` to cancel.
 Before making requests to Immich, the script prints the effective run settings, including faces per row, face size, spacing, maximum faces, and whether metadata is included. It never prints the API key.
 Pass `--save-crops` to also save each face included in the contact sheet as a separate JPEG in the `_crops/` folder under your current working directory. This is off by default. Existing crop files are kept; new files receive a numeric suffix if a filename is already in use.
+Pass `--create-collage` to produce an additional compact, masonry-style image from the same crops. It preserves each crop's proportions and uses the configured face size, faces per row, and spacing. The collage is saved beside the contact sheet with `_collage` added to its filename (for example, `joana_faces_collage.jpg`). This option is off by default and uses the existing Pillow dependency.
+The script checks the estimated sheet dimensions before downloading face previews and checks the exact dimensions before writing. If a sheet would exceed Pillow's 65,500-pixel limit, reduce `--max-faces` or `--face-size`, or increase `--faces-per-row`.
 
 To list all options, run either:
 
@@ -69,6 +71,7 @@ python3 immich_face_sheet.py help
 | `--include-metadata` | Show source filename and date below each face. | Off |
 | `--face-spacing N` | Pixel gap between face tiles. | `0` |
 | `--save-crops` | Save each included face as a separate JPEG in `_crops/`. | Off |
+| `--create-collage` | Also create a compact collage beside the contact sheet. | Off |
 | `--max-faces N` | Maximum number of face crops to include, taken in Immich's search order. If omitted, include all matching faces. | All |
 | `--workers N` | Number of concurrent requests to Immich. | `6` |
 | `-h`, `--help`, `help` | Show usage information. | — |
@@ -84,5 +87,6 @@ python3 immich_face_sheet.py \
   --face-size 180 \
   --max-faces 300 \
   --face-spacing 8 \
-  --include-metadata
+  --include-metadata \
+  --create-collage
 ```
