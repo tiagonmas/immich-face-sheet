@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""Build a labeled contact sheet of one person's Immich face crops.
+
+Requires: python3 -m pip install requests pillow
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
+from io import BytesIO
+from pathlib import Path
+import os
+import sys
+import threading
+from typing import Any
+
+try:
+    import requests
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+except ImportError as exc:
+    print("Missing dependency. Install them with: python3 -m pip install requests pillow", file=sys.stderr)
+    raise SystemExit(2) from exc
+
+
+THREAD_LOCAL = threading.local()
+
+
+def session_for_thread(api_key: str) -> requests.Session:
+    session = getattr(THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"x-api-key": api_key, "Accept": "application/json"})
+        THREAD_LOCAL.session = session
+    return session
+
+
+def request_json(url: str, api_key: str, *, method: str = "GET", **kwargs: Any) -> Any:
+    response = session_for_thread(api_key).request(method, url, timeout=90, **kwargs)
+    if not response.ok:
+        detail = response.text.strip()
+        raise requests.HTTPError(
+            f"Immich returned HTTP {response.status_code} for {response.url}: {detail}",
+            response=response,
+        )
+    return response.json()
+
+
+def asset_items(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
+    """Return search results and the cursor for the next page, if any."""
+    node = payload
+    if isinstance(node, dict) and isinstance(node.get("assets"), dict):
+        node = node["assets"]
+    if isinstance(node, dict):
+        items = node.get("items", [])
+        return items, node.get("nextCursor")
+    if isinstance(node, list):
+        return node, None
+    return [], None
+
+
+def fetch_people(api_root: str, api_key: str) -> list[dict[str, Any]]:
+    people: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        result = request_json(
+            f"{api_root}/people", api_key, params={"page": page, "size": 1000}
+        )
+        node = result.get("people", result) if isinstance(result, dict) else result
+        if isinstance(node, dict):
+            items = node.get("items", [])
+        elif isinstance(node, list):
+            items = node
+        else:
+            items = []
+        people.extend(item for item in items if isinstance(item, dict) and item.get("id"))
+        if len(items) < 1000:
+            break
+        page += 1
+    return people
+
+
+def choose_person(people: list[dict[str, Any]], requested_name: str) -> dict[str, Any]:
+    query = " ".join(requested_name.casefold().split())
+    ranked = []
+    for person in people:
+        name = " ".join(str(person.get("name") or "").casefold().split())
+        if not name:
+            continue
+        score = SequenceMatcher(None, query, name).ratio()
+        if name.startswith(query + " ") or query.startswith(name + " "):
+            score = max(score, 0.8)
+        if name == query:
+            score = 1.0
+        if score >= 0.7:
+            ranked.append((score, person))
+    ranked.sort(key=lambda pair: (-pair[0], str(pair[1].get("name", "")).casefold()))
+    if not ranked:
+        raise RuntimeError(
+            f"No Immich person matched '{requested_name}'. Check the spelling or try the person's exact name."
+        )
+    if len(ranked) == 1:
+        return ranked[0][1]
+
+    print(f"Several Immich people are similar to '{requested_name}':", flush=True)
+    for index, (score, person) in enumerate(ranked, start=1):
+        count = person.get("assetCount", "?")
+        print(f"  {index}. {person.get('name') or '(unnamed)'} — {count} assets", flush=True)
+    while True:
+        answer = input("Enter the number of the correct person (or q to cancel): ").strip().casefold()
+        if answer == "q":
+            raise RuntimeError("Person selection cancelled.")
+        if answer.isdigit() and 1 <= int(answer) <= len(ranked):
+            selected = ranked[int(answer) - 1][1]
+            print(f"Selected {selected.get('name')}.", flush=True)
+            return selected
+        print(f"Enter a number from 1 to {len(ranked)}, or q to cancel.", flush=True)
+
+
+def fetch_assets(api_root: str, person_id: str, api_key: str) -> list[dict[str, Any]]:
+    url = f"{api_root}/search/metadata"
+    assets: list[dict[str, Any]] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    while True:
+        body: dict[str, Any] = {
+            "size": 1000,
+            "withPeople": True,
+            "filter": {"personIds": {"all": [person_id]}},
+        }
+        if cursor:
+            body["cursor"] = cursor
+        result = request_json(
+            url,
+            api_key,
+            method="POST",
+            json=body,
+        )
+        items, next_cursor = asset_items(result)
+        assets.extend(item for item in items if isinstance(item, dict) and item.get("id"))
+        print(f"Found {len(assets)} matching assets…", flush=True)
+        if not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            raise RuntimeError("Immich returned a repeated pagination cursor; stopping to avoid a loop.")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return assets
+
+
+def faces_for_asset(api_root: str, asset: dict[str, Any], person_id: str, api_key: str) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for person in asset.get("people") or []:
+        if person.get("id") == person_id:
+            matches.extend(face for face in (person.get("faces") or []) if isinstance(face, dict))
+    if matches:
+        return matches
+
+    # Immich v3 may omit face boxes from search results. Ask for this asset's
+    # faces directly in that case and retain only the selected person's boxes.
+    payload = request_json(f"{api_root}/faces", api_key, params={"id": asset["id"]})
+    if isinstance(payload, dict):
+        payload = payload.get("faces", [])
+    if not isinstance(payload, list):
+        return []
+    return [
+        face for face in payload
+        if isinstance(face, dict)
+        and isinstance(face.get("person"), dict)
+        and face["person"].get("id") == person_id
+    ]
+
+
+def crop_face(api_root: str, asset: dict[str, Any], face: dict[str, Any], api_key: str) -> Image.Image:
+    thumb_url = f"{api_root}/assets/{asset['id']}/thumbnail"
+    response = session_for_thread(api_key).get(
+        thumb_url, params={"size": "preview", "edited": "true"}, timeout=90
+    )
+    if response.status_code == 400:
+        response = session_for_thread(api_key).get(
+            thumb_url, params={"size": "thumbnail", "edited": "true"}, timeout=90
+        )
+    response.raise_for_status()
+    with Image.open(BytesIO(response.content)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image_width = int(face.get("imageWidth") or asset.get("width") or image.width)
+        image_height = int(face.get("imageHeight") or asset.get("height") or image.height)
+        sx, sy = image.width / image_width, image.height / image_height
+        left = round(int(face["boundingBoxX1"]) * sx)
+        top = round(int(face["boundingBoxY1"]) * sy)
+        right = round(int(face["boundingBoxX2"]) * sx)
+        bottom = round(int(face["boundingBoxY2"]) * sy)
+        left, top = max(0, left), max(0, top)
+        right, bottom = min(image.width, right), min(image.height, bottom)
+        if right <= left or bottom <= top:
+            raise ValueError("Immich returned an empty face rectangle")
+        return image.crop((left, top, right, bottom)).copy()
+
+
+def label_for(asset: dict[str, Any], index: int, include_metadata: bool) -> str:
+    if not include_metadata:
+        return ""
+    date = str(asset.get("localDateTime") or asset.get("fileCreatedAt") or "")[:10]
+    name = str(asset.get("originalFileName") or asset.get("id") or "")
+    return f"{index:04d} {date}\n{name}"
+
+
+def build_sheet(
+    crops: list[tuple[Image.Image, str]], output: Path, columns: int, tile: int,
+    spacing: int, include_metadata: bool,
+) -> None:
+    if not crops:
+        raise RuntimeError("No face crops were found for that person.")
+    label_height = 30 if include_metadata else 0
+    cell_height = tile + label_height
+    rows = (len(crops) + columns - 1) // columns
+    width = columns * tile + max(0, columns - 1) * spacing
+    height = rows * cell_height + max(0, rows - 1) * spacing
+    sheet = Image.new("RGB", (width, height), "#202124")
+    draw = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 10)
+    except OSError:
+        font = ImageFont.load_default()
+    for index, (crop, label) in enumerate(crops):
+        x = (index % columns) * (tile + spacing)
+        y = (index // columns) * (cell_height + spacing)
+        fitted = ImageOps.contain(crop, (tile - 8, tile - 8), Image.Resampling.LANCZOS)
+        sheet.paste(fitted, (x + (tile - fitted.width) // 2, y + (tile - fitted.height) // 2))
+        if include_metadata:
+            draw.multiline_text((x + 2, y + tile), label[:90], fill="white", font=font, spacing=1)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output, quality=92, optimize=True)
+
+
+def save_crops(crops: list[tuple[Image.Image, str]], directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for index, (crop, _label) in enumerate(crops, start=1):
+        path = directory / f"face_{index:04d}.jpg"
+        suffix = 1
+        while path.exists():
+            suffix += 1
+            path = directory / f"face_{index:04d}_{suffix}.jpg"
+        crop.save(path, format="JPEG", quality=95, optimize=True)
+
+
+def confirm_output_path(requested: str) -> Path | None:
+    output = Path(requested).expanduser()
+    while output.exists():
+        if output.is_dir():
+            print(f"The output path is a directory: {output}", file=sys.stderr)
+            return None
+        answer = input(f"{output} already exists. Overwrite it? [y/N]: ").strip().casefold()
+        if answer in {"y", "yes"}:
+            return output
+        if answer in {"n", "no", ""}:
+            while True:
+                new_name = input("Enter a new output filename (or q to quit): ").strip()
+                if new_name.casefold() == "q":
+                    return None
+                if not new_name:
+                    print("Please enter a filename, or q to quit.")
+                    continue
+                output = Path(new_name).expanduser()
+                if output.exists() and output.is_dir():
+                    print(f"That path is a directory: {output}")
+                    continue
+                break
+            continue
+        print("Please answer y or n.")
+    return output
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "API key: pass --api-key or set IMMICH_API_KEY. If you do not have a key, "
+            "create one in Immich Account Settings > API Keys with read access to people and assets. "
+            "You can also run this program with the 'help' command."
+        ),
+    )
+    parser.add_argument("--base-url", required=True, help="Immich URL, such as http://192.168.1.200:2283")
+    parser.add_argument("--person-name", required=True, help="Person name as shown in Immich")
+    parser.add_argument("--api-key", help="Immich API key (or set IMMICH_API_KEY)")
+    parser.add_argument("--output", default="face-sheet.jpg", help="Output JPEG path (default: face-sheet.jpg)")
+    parser.add_argument(
+        "--faces-per-row", "--columns", dest="columns", type=int, default=10,
+        help="Number of face crops per row (default: 10; --columns is an alias)",
+    )
+    parser.add_argument(
+        "--face-size", "--tile-size", dest="tile_size", type=int, default=112,
+        help="Face tile width and height in pixels (default: 112; --tile-size is an alias)",
+    )
+    parser.add_argument(
+        "--include-metadata", action="store_true",
+        help="Show source filename and date below each face (metadata is omitted by default)",
+    )
+    parser.add_argument(
+        "--face-spacing", type=int, default=0,
+        help="Pixel gap between face tiles (default: 0)",
+    )
+    parser.add_argument(
+        "--save-crops", action="store_true",
+        help="Save individual face crops in the local _crops/ folder (off by default)",
+    )
+    parser.add_argument(
+        "--max-faces", type=int, default=None,
+        help="Maximum face crops to include; by default include all faces found",
+    )
+    parser.add_argument("--workers", type=int, default=6, help="Concurrent Immich requests (default: 6)")
+    if sys.argv[1:] == ["help"]:
+        parser.print_help()
+        return 0
+    args = parser.parse_args()
+    if args.columns < 1 or args.tile_size < 32 or args.workers < 1:
+        parser.error("faces-per-row and workers must be positive; face-size must be at least 32")
+    if args.face_spacing < 0:
+        parser.error("face-spacing cannot be negative")
+    if args.max_faces is not None and args.max_faces < 1:
+        parser.error("max-faces must be a positive integer")
+
+    output = confirm_output_path(args.output)
+    if output is None:
+        print("Output cancelled; no file was written.")
+        return 1
+
+    base_url = args.base_url.rstrip("/")
+    api_root = f"{base_url}/api"
+    api_key = args.api_key or os.environ.get("IMMICH_API_KEY")
+    if not api_key:
+        print(
+            "No Immich API key was provided. Create one in Immich > Account Settings > API Keys "
+            "with read access to people and assets, then pass it with --api-key or set IMMICH_API_KEY.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print("Run settings:", flush=True)
+    print(f"  Immich server: {base_url}", flush=True)
+    print(f"  Person name: {args.person_name}", flush=True)
+    print(f"  Output file: {output}", flush=True)
+    print(f"  Faces per row: {args.columns}", flush=True)
+    print(f"  Face size: {args.tile_size} x {args.tile_size} pixels", flush=True)
+    print(f"  Space between faces: {args.face_spacing} pixels", flush=True)
+    print(f"  Maximum faces: {args.max_faces if args.max_faces is not None else 'all'}", flush=True)
+    print(f"  Metadata: {'included' if args.include_metadata else 'omitted'}", flush=True)
+    print(f"  Save individual crops: {'yes (_crops/)' if args.save_crops else 'no'}", flush=True)
+    print(f"  Concurrent requests: {args.workers}", flush=True)
+    print("  API key: provided (value hidden)", flush=True)
+
+    try:
+        people = fetch_people(api_root, api_key)
+        person = choose_person(people, args.person_name)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        if status == 401 or status == 403:
+            print("Immich rejected the key. Create or update a key with read access to people and assets.", file=sys.stderr)
+        else:
+            print(f"Could not list Immich people ({status}): {exc}", file=sys.stderr)
+        return 1
+    except (RuntimeError, EOFError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    person_id = person["id"]
+    person_name = person.get("name") or args.person_name
+
+    try:
+        print(f"Getting assets for {person_name}…", flush=True)
+        assets = fetch_assets(api_root, person_id, api_key)
+        if not assets:
+            raise RuntimeError("Immich returned no matching assets. Check the person ID and API key permissions.")
+
+        crops: list[tuple[Image.Image, str]] = []
+        errors = 0
+
+        def process(asset: dict[str, Any]) -> list[tuple[Image.Image, str]]:
+            faces = faces_for_asset(api_root, asset, person_id, api_key)
+            return [
+                (crop_face(api_root, asset, face, api_key), label_for(asset, len(faces), args.include_metadata))
+                for face in faces
+            ]
+
+        processed = 0
+        batch_size = args.workers
+        for start in range(0, len(assets), batch_size):
+            batch = assets[start:start + batch_size]
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = [pool.submit(process, asset) for asset in batch]
+                # Collect each batch in Immich's result order so a maximum
+                # always selects the same first faces when rerun.
+                for asset, future in zip(batch, futures):
+                    try:
+                        result = future.result()
+                        for crop, _label in result:
+                            crops.append((crop, label_for(
+                                asset, len(crops) + 1, args.include_metadata
+                            )))
+                            if args.max_faces is not None and len(crops) >= args.max_faces:
+                                break
+                    except Exception as exc:
+                        errors += 1
+                        print(f"Skipped {asset.get('originalFileName') or asset['id']}: {exc}", file=sys.stderr)
+                    processed += 1
+                    if processed % 100 == 0 or processed == len(assets) or (
+                        args.max_faces is not None and len(crops) >= args.max_faces
+                    ):
+                        print(f"Processed {processed}/{len(assets)} assets; {len(crops)} face crops", flush=True)
+                    if args.max_faces is not None and len(crops) >= args.max_faces:
+                        break
+            if args.max_faces is not None and len(crops) >= args.max_faces:
+                break
+
+        if args.save_crops:
+            crop_directory = Path.cwd() / "_crops"
+            save_crops(crops, crop_directory)
+            print(f"Saved individual face crops to {crop_directory}", flush=True)
+
+        build_sheet(
+            crops, output, args.columns, args.tile_size,
+            args.face_spacing, args.include_metadata,
+        )
+        print(f"Saved {len(crops)} face crops for {person_name} to {output.resolve()}")
+        if errors:
+            print(f"Skipped {errors} assets because Immich returned an error for them.", file=sys.stderr)
+        return 0
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        if status == 401 or status == 403:
+            print("Immich rejected the key. Create an API key with asset read access and try again.", file=sys.stderr)
+        else:
+            print(f"Immich request failed ({status}): {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Could not create the face sheet: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,22 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Generated face sheets
+face-sheet*.jpg
+*_faces.jpg
+_crops/
+
+# Local/editor files
+.DS_Store
+*.log
