@@ -218,16 +218,78 @@ def sheet_dimensions(
     return width, height
 
 
+def sheet_dimension_suggestions(
+    face_count: int, columns: int, tile: int, spacing: int, include_metadata: bool
+) -> list[str]:
+    """Suggest settings that keep the contact sheet within Pillow's dimension limit."""
+    suggestions = []
+    label_height = 30 if include_metadata else 0
+    cell_height = tile + label_height
+    max_rows = (MAX_IMAGE_DIMENSION + spacing) // (cell_height + spacing)
+
+    # More columns preserves every face at its current size, as long as the
+    # resulting width also remains within Pillow's limit.
+    if max_rows > 0:
+        needed_columns = max(columns, (face_count + max_rows - 1) // max_rows)
+        width, height = sheet_dimensions(
+            face_count, needed_columns, tile, spacing, include_metadata
+        )
+        if needed_columns > columns and width <= MAX_IMAGE_DIMENSION:
+            suggestions.append(
+                f"Recommended: --faces-per-row {needed_columns} (keeps all {face_count:,} face crops "
+                f"at {tile}px; sheet {width:,} x {height:,})"
+            )
+
+    # Keep all faces and the current column count, using the largest smaller
+    # tile that fits. Respect the CLI's minimum supported tile size.
+    for smaller_tile in range(tile - 1, 31, -1):
+        width, height = sheet_dimensions(
+            face_count, columns, smaller_tile, spacing, include_metadata
+        )
+        if width <= MAX_IMAGE_DIMENSION and height <= MAX_IMAGE_DIMENSION:
+            suggestions.append(
+                f"--face-size {smaller_tile} (keeps all {face_count:,} face crops and "
+                f"{columns} faces per row; sheet {width:,} x {height:,})"
+            )
+            break
+
+    # Keep the current tile and column count, and cap the number of faces to
+    # the largest complete set that fits.
+    if max_rows > 0:
+        max_faces = columns * max_rows
+        if max_faces < face_count and max_faces > 0:
+            width, height = sheet_dimensions(
+                max_faces, columns, tile, spacing, include_metadata
+            )
+            suggestions.append(
+                f"--max-faces {max_faces} (keeps {columns} faces per row at {tile}px; "
+                f"sheet {width:,} x {height:,})"
+            )
+    return suggestions
+
+
 def validate_sheet_dimensions(
     face_count: int, columns: int, tile: int, spacing: int, include_metadata: bool
 ) -> None:
     width, height = sheet_dimensions(face_count, columns, tile, spacing, include_metadata)
     if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
-        raise RuntimeError(
+        message = (
             f"The contact sheet would be {width} x {height} pixels, exceeding Pillow's "
             f"{MAX_IMAGE_DIMENSION}-pixel limit per dimension. Reduce --max-faces or "
             "--face-size, or increase --faces-per-row."
         )
+        suggestions = sheet_dimension_suggestions(
+            face_count, columns, tile, spacing, include_metadata
+        )
+        if suggestions:
+            message += (
+                f"\nFor {face_count:,} face crops with the current settings "
+                f"(--faces-per-row {columns}, --face-size {tile}, "
+                f"--face-spacing {spacing}), try one of:"
+            )
+            for suggestion in suggestions:
+                message += f"\n  {suggestion}"
+        raise RuntimeError(message)
 
 
 def build_sheet(
@@ -294,6 +356,74 @@ def build_collage(
     collage.save(output, quality=92, optimize=True)
 
 
+def photomosaic_grid(source: Image.Image, face_size: int) -> tuple[int, int]:
+    columns = max(1, round(source.width / face_size))
+    rows = max(1, round(source.height / face_size))
+    return columns, rows
+
+
+def validate_photomosaic_dimensions(source: Image.Image, face_size: int, spacing: int) -> tuple[int, int]:
+    columns, rows = photomosaic_grid(source, face_size)
+    width = columns * face_size + max(0, columns - 1) * spacing
+    height = rows * face_size + max(0, rows - 1) * spacing
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise RuntimeError(
+            f"The photomosaic would be {width} x {height} pixels, exceeding Pillow's "
+            f"{MAX_IMAGE_DIMENSION}-pixel limit per dimension. Use a smaller input image, "
+            "reduce --face-size, or reduce --face-spacing."
+        )
+    return width, height
+
+
+def build_photomosaic(
+    crops: list[tuple[Image.Image, str]], source: Image.Image, output: Path,
+    face_size: int, spacing: int,
+) -> None:
+    """Fill a target image with face tiles selected by average color."""
+    if not crops:
+        raise RuntimeError("No face crops were found for the photomosaic.")
+    columns, rows = photomosaic_grid(source, face_size)
+    width, height = validate_photomosaic_dimensions(source, face_size, spacing)
+    target_colors = source.resize((columns, rows), Image.Resampling.LANCZOS).convert("RGB")
+    target_pixels = list(target_colors.get_flattened_data())
+
+    tiles: list[Image.Image] = []
+    colors: list[tuple[int, int, int]] = []
+    for crop, _label in crops:
+        tile = ImageOps.fit(crop.convert("RGB"), (face_size, face_size), Image.Resampling.LANCZOS)
+        tiles.append(tile)
+        colors.append(tile.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0)))
+
+    mosaic = Image.new("RGB", (width, height), "#202124")
+    usage = [0] * len(tiles)
+    previous_row: list[int] = []
+    for index, target_color in enumerate(target_pixels):
+        x_index, y_index = index % columns, index // columns
+        best_candidate = 0
+        best_score: int | None = None
+        left_candidate = previous_row[x_index - 1] if x_index > 0 else None
+        for candidate, color in enumerate(colors):
+            red = target_color[0] - color[0]
+            green = target_color[1] - color[1]
+            blue = target_color[2] - color[2]
+            score = red * red + green * green + blue * blue + usage[candidate] * 500
+            if candidate == left_candidate and len(tiles) > 1:
+                score += 100000
+            if best_score is None or score < best_score:
+                best_candidate, best_score = candidate, score
+
+        x = x_index * (face_size + spacing)
+        y = y_index * (face_size + spacing)
+        mosaic.paste(tiles[best_candidate], (x, y))
+        usage[best_candidate] += 1
+        if x_index == 0:
+            previous_row = []
+        previous_row.append(best_candidate)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    mosaic.save(output, quality=92, optimize=True)
+
+
 def save_crops(crops: list[tuple[Image.Image, str]], directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for index, (crop, _label) in enumerate(crops, start=1):
@@ -344,7 +474,12 @@ def main() -> int:
     parser.add_argument("--base-url", required=True, help="Immich URL, such as http://192.168.1.200:2283")
     parser.add_argument("--person-name", required=True, help="Person name as shown in Immich")
     parser.add_argument("--api-key", help="Immich API key (or set IMMICH_API_KEY)")
-    parser.add_argument("--output", default="face-sheet.jpg", help="Output JPEG path (default: face-sheet.jpg)")
+    parser.add_argument(
+        "--mode", choices=("contact-sheet", "collage", "photomosaic"),
+        default="contact-sheet",
+        help="Output type (default: contact-sheet)",
+    )
+    parser.add_argument("--output", help="Output JPEG path (default depends on --mode)")
     parser.add_argument(
         "--faces-per-row", "--columns", dest="columns", type=int, default=10,
         help="Number of face crops per row (default: 10; --columns is an alias)",
@@ -366,8 +501,8 @@ def main() -> int:
         help="Save individual face crops in the local _crops/ folder (off by default)",
     )
     parser.add_argument(
-        "--create-collage", action="store_true",
-        help="Also create a compact collage beside the contact sheet (off by default)",
+        "--photomosaic-image", metavar="PATH",
+        help="Target image required when --mode photomosaic is selected",
     )
     parser.add_argument(
         "--max-faces", type=int, default=None,
@@ -384,18 +519,39 @@ def main() -> int:
         parser.error("face-spacing cannot be negative")
     if args.max_faces is not None and args.max_faces < 1:
         parser.error("max-faces must be a positive integer")
+    if args.mode == "photomosaic" and not args.photomosaic_image:
+        parser.error("--photomosaic-image is required when --mode photomosaic is selected")
+    if args.mode != "photomosaic" and args.photomosaic_image:
+        parser.error("--photomosaic-image can only be used with --mode photomosaic")
+    if args.mode != "contact-sheet" and args.include_metadata:
+        parser.error("--include-metadata can only be used with --mode contact-sheet")
 
-    output = confirm_output_path(args.output)
+    photomosaic_source = None
+    if args.photomosaic_image:
+        source_path = Path(args.photomosaic_image).expanduser()
+        if not source_path.is_file():
+            parser.error(f"photomosaic input image does not exist: {source_path}")
+        try:
+            with Image.open(source_path) as source_file:
+                photomosaic_source = ImageOps.exif_transpose(source_file).convert("RGB")
+        except Exception as exc:
+            parser.error(f"could not open photomosaic input image {source_path}: {exc}")
+        try:
+            validate_photomosaic_dimensions(photomosaic_source, args.tile_size, args.face_spacing)
+        except RuntimeError as exc:
+            parser.error(str(exc))
+
+    default_outputs = {
+        "contact-sheet": "face-sheet.jpg",
+        "collage": "face-collage.jpg",
+        "photomosaic": "face-photomosaic.jpg",
+    }
+    output = confirm_output_path(args.output or default_outputs[args.mode])
     if output is None:
         print("Output cancelled; no file was written.")
         return 1
-    collage_output = None
-    if args.create_collage:
-        collage_output = output.with_name(f"{output.stem}_collage.jpg")
-        collage_output = confirm_output_path(str(collage_output))
-        if collage_output is None:
-            print("Collage output cancelled; no file was written.")
-            return 1
+    if photomosaic_source is not None and output.resolve() == Path(args.photomosaic_image).expanduser().resolve():
+        parser.error("photomosaic output path would overwrite its input image")
 
     base_url = args.base_url.rstrip("/")
     api_root = f"{base_url}/api"
@@ -409,6 +565,7 @@ def main() -> int:
         return 2
 
     print("Run settings:", flush=True)
+    print(f"  Output mode: {args.mode}", flush=True)
     print(f"  Immich server: {base_url}", flush=True)
     print(f"  Person name: {args.person_name}", flush=True)
     print(f"  Output file: {output}", flush=True)
@@ -418,7 +575,8 @@ def main() -> int:
     print(f"  Maximum faces: {args.max_faces if args.max_faces is not None else 'all'}", flush=True)
     print(f"  Metadata: {'included' if args.include_metadata else 'omitted'}", flush=True)
     print(f"  Save individual crops: {'yes (_crops/)' if args.save_crops else 'no'}", flush=True)
-    print(f"  Create collage: {'yes (' + str(collage_output) + ')' if args.create_collage else 'no'}", flush=True)
+    if photomosaic_source is not None:
+        print(f"  Photomosaic target: {args.photomosaic_image}", flush=True)
     print(f"  Concurrent requests: {args.workers}", flush=True)
     print("  API key: provided (value hidden)", flush=True)
 
@@ -445,12 +603,12 @@ def main() -> int:
         if not assets:
             raise RuntimeError("Immich returned no matching assets. Check the person ID and API key permissions.")
 
-        estimated_faces = min(args.max_faces, len(assets)) if args.max_faces is not None else len(assets)
-        validate_sheet_dimensions(
-            estimated_faces, args.columns, args.tile_size,
-            args.face_spacing, args.include_metadata,
-        )
-
+        if args.mode == "contact-sheet":
+            estimated_faces = min(args.max_faces, len(assets)) if args.max_faces is not None else len(assets)
+            validate_sheet_dimensions(
+                estimated_faces, args.columns, args.tile_size,
+                args.face_spacing, args.include_metadata,
+            )
         crops: list[tuple[Image.Image, str]] = []
         errors = 0
 
@@ -496,13 +654,18 @@ def main() -> int:
             save_crops(crops, crop_directory)
             print(f"Saved individual face crops to {crop_directory}", flush=True)
 
-        build_sheet(
-            crops, output, args.columns, args.tile_size,
-            args.face_spacing, args.include_metadata,
-        )
-        if args.create_collage and collage_output is not None:
-            build_collage(crops, collage_output, args.columns, args.tile_size, args.face_spacing)
-            print(f"Saved collage to {collage_output.resolve()}", flush=True)
+        if args.mode == "contact-sheet":
+            build_sheet(
+                crops, output, args.columns, args.tile_size,
+                args.face_spacing, args.include_metadata,
+            )
+        elif args.mode == "collage":
+            build_collage(crops, output, args.columns, args.tile_size, args.face_spacing)
+        else:
+            build_photomosaic(
+                crops, photomosaic_source, output,
+                args.tile_size, args.face_spacing,
+            )
         print(f"Saved {len(crops)} face crops for {person_name} to {output.resolve()}")
         if errors:
             print(f"Skipped {errors} assets because Immich returned an error for them.", file=sys.stderr)
@@ -515,7 +678,7 @@ def main() -> int:
             print(f"Immich request failed ({status}): {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        print(f"Could not create the face sheet: {exc}", file=sys.stderr)
+        print(f"Could not create the {args.mode}: {exc}", file=sys.stderr)
         return 1
 
 

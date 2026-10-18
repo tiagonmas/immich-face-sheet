@@ -16,6 +16,7 @@ env/
 face-sheet*.jpg
 *_faces.jpg
 *_collage.jpg
+*_photomosaic.jpg
 _crops/
 
 # Local/editor files
