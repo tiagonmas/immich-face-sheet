@@ -1,0 +1,15 @@
+services:
+  immich-face-sheet:
+    build: .
+    ports:
+      - "127.0.0.1:${FACE_SHEET_PORT:-8080}:8080"
+    environment:
+      DATA_DIR: /data
+      IMMICH_BASE_URL: ${IMMICH_BASE_URL:-}
+      IMMICH_API_KEY: ${IMMICH_API_KEY:-}
+    volumes:
+      - face-sheet-data:/data
+    restart: unless-stopped
+
+volumes:
+  face-sheet-data:

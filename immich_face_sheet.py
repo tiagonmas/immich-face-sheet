@@ -14,8 +14,10 @@ from io import BytesIO
 import json
 from pathlib import Path
 import os
+import re
 import sys
 import threading
+import unicodedata
 from typing import Any
 
 try:
@@ -202,7 +204,7 @@ def crop_face(api_root: str, asset: dict[str, Any], face: dict[str, Any], api_ke
 
 
 def crop_cache_path(
-    cache_directory: Path, api_root: str, person_id: str,
+    cache_directory: Path, person_name: str, api_root: str, person_id: str,
     asset: dict[str, Any], face: dict[str, Any],
 ) -> Path:
     identity = {
@@ -221,21 +223,44 @@ def crop_cache_path(
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return cache_directory / f"{digest}.jpg"
+    return cache_directory / f"{person_name_slug(person_name)}_{digest}.jpg"
+
+
+def person_name_slug(name: str) -> str:
+    """Return a short, filesystem-safe prefix for crop filenames."""
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
+    return slug[:64].rstrip("_") or "person"
 
 
 def cached_or_fetch_crop(
-    api_root: str, person_id: str, asset: dict[str, Any], face: dict[str, Any],
+    person_name: str, api_root: str, person_id: str,
+    asset: dict[str, Any], face: dict[str, Any],
     api_key: str, cache_directory: Path, force_fetch: bool,
 ) -> tuple[Image.Image, bool]:
     """Load a cached face crop or fetch it and update the local cache."""
-    cache_path = crop_cache_path(cache_directory, api_root, person_id, asset, face)
+    cache_path = crop_cache_path(
+        cache_directory, person_name, api_root, person_id, asset, face
+    )
+    legacy_cache_path = cache_directory / cache_path.name.removeprefix(
+        f"{person_name_slug(person_name)}_"
+    )
     if cache_path.is_file() and not force_fetch:
         try:
             with Image.open(cache_path) as cached:
                 return ImageOps.exif_transpose(cached).convert("RGB").copy(), True
         except Exception:
             # A truncated or unsupported cache entry is refreshed from Immich.
+            pass
+    elif legacy_cache_path.is_file() and not force_fetch:
+        try:
+            with Image.open(legacy_cache_path) as cached:
+                crop = ImageOps.exif_transpose(cached).convert("RGB").copy()
+            cache_directory.mkdir(parents=True, exist_ok=True)
+            legacy_cache_path.replace(cache_path)
+            return crop, True
+        except Exception:
+            # Invalid legacy cache entries are refreshed from Immich.
             pass
 
     crop = crop_face(api_root, asset, face, api_key)
@@ -423,7 +448,8 @@ def minimum_photomosaic_tile_size(source: Image.Image, face_count: int) -> int:
 
 
 def choose_photomosaic_tile_size(
-    source: Image.Image, face_count: int, requested_size: int | None
+    source: Image.Image, face_count: int, requested_size: int | None,
+    *, use_minimum_without_prompt: bool = False,
 ) -> int | None:
     minimum_size = minimum_photomosaic_tile_size(source, face_count)
     columns, rows = photomosaic_grid(source, minimum_size)
@@ -436,6 +462,9 @@ def choose_photomosaic_tile_size(
     )
     if requested_size is not None:
         return requested_size
+    if use_minimum_without_prompt:
+        print(f"Using the calculated minimum tile size: {minimum_size}px.", flush=True)
+        return minimum_size
 
     while True:
         try:
@@ -532,14 +561,17 @@ def build_photomosaic(
     mosaic.save(output, quality=92, optimize=True)
 
 
-def save_crops(crops: list[tuple[Image.Image, str]], directory: Path) -> None:
+def save_crops(
+    crops: list[tuple[Image.Image, str]], directory: Path, person_name: str
+) -> None:
     directory.mkdir(parents=True, exist_ok=True)
+    name_prefix = person_name_slug(person_name)
     for index, (crop, _label) in enumerate(crops, start=1):
-        path = directory / f"face_{index:04d}.jpg"
+        path = directory / f"{name_prefix}_{index:04d}.jpg"
         suffix = 1
         while path.exists():
             suffix += 1
-            path = directory / f"face_{index:04d}_{suffix}.jpg"
+            path = directory / f"{name_prefix}_{index:04d}_{suffix}.jpg"
         crop.save(path, format="JPEG", quality=95, optimize=True)
 
 
@@ -580,7 +612,8 @@ def main() -> int:
         ),
     )
     parser.add_argument("--base-url", required=True, help="Immich URL, such as http://192.168.1.200:2283")
-    parser.add_argument("--person-name", required=True, help="Person name as shown in Immich")
+    parser.add_argument("--person-name", help="Person name as shown in Immich")
+    parser.add_argument("--person-id", help="Select a person by Immich ID instead of prompting for a similar name")
     parser.add_argument("--api-key", help="Immich API key (or set IMMICH_API_KEY)")
     parser.add_argument(
         "--mode", choices=("contact-sheet", "collage", "photomosaic"),
@@ -599,6 +632,10 @@ def main() -> int:
     parser.add_argument(
         "--photomosaic-tile-size", type=int, metavar="PIXELS",
         help="Photomosaic tile size; if omitted, calculate a minimum and prompt for a choice",
+    )
+    parser.add_argument(
+        "--auto-photomosaic-tile-size", action="store_true",
+        help="Use the calculated minimum tile size without prompting",
     )
     parser.add_argument(
         "--include-metadata", action="store_true",
@@ -629,6 +666,8 @@ def main() -> int:
         parser.print_help()
         return 0
     args = parser.parse_args()
+    if not args.person_name and not args.person_id:
+        parser.error("either --person-name or --person-id is required")
     if args.columns < 1 or args.tile_size < 32 or args.workers < 1:
         parser.error("faces-per-row and workers must be positive; face-size must be at least 32")
     if args.face_spacing < 0:
@@ -643,6 +682,10 @@ def main() -> int:
         parser.error("--photomosaic-tile-size can only be used with --mode photomosaic")
     if args.photomosaic_tile_size is not None and args.photomosaic_tile_size < 1:
         parser.error("photomosaic-tile-size must be at least 1 pixel")
+    if args.auto_photomosaic_tile_size and args.mode != "photomosaic":
+        parser.error("--auto-photomosaic-tile-size can only be used with --mode photomosaic")
+    if args.auto_photomosaic_tile_size and args.photomosaic_tile_size is not None:
+        parser.error("--auto-photomosaic-tile-size cannot be combined with --photomosaic-tile-size")
     if args.mode != "contact-sheet" and args.include_metadata:
         parser.error("--include-metadata can only be used with --mode contact-sheet")
 
@@ -689,7 +732,7 @@ def main() -> int:
     print("Run settings:", flush=True)
     print(f"  Output mode: {args.mode}", flush=True)
     print(f"  Immich server: {base_url}", flush=True)
-    print(f"  Person name: {args.person_name}", flush=True)
+    print(f"  Person name: {args.person_name or args.person_id}", flush=True)
     print(f"  Output file: {output}", flush=True)
     if args.mode == "photomosaic":
         tile_setting = (
@@ -717,7 +760,12 @@ def main() -> int:
 
     try:
         people = fetch_people(api_root, api_key)
-        person = choose_person(people, args.person_name)
+        if args.person_id:
+            person = next((item for item in people if item.get("id") == args.person_id), None)
+            if person is None:
+                raise RuntimeError(f"No Immich person found with ID '{args.person_id}'.")
+        else:
+            person = choose_person(people, args.person_name)
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "unknown"
         if status == 401 or status == 403:
@@ -730,7 +778,7 @@ def main() -> int:
         return 1
 
     person_id = person["id"]
-    person_name = person.get("name") or args.person_name
+    person_name = person.get("name") or args.person_name or args.person_id or "person"
 
     try:
         print(f"Getting assets for {person_name}…", flush=True)
@@ -754,7 +802,7 @@ def main() -> int:
             return [
                 (
                     *cached_or_fetch_crop(
-                        api_root, person_id, asset, face, api_key,
+                        person_name, api_root, person_id, asset, face, api_key,
                         cache_directory, args.force_fetch,
                     ),
                     label_for(asset, len(faces), args.include_metadata),
@@ -803,7 +851,8 @@ def main() -> int:
             if not crops:
                 raise RuntimeError("No face crops were found for the photomosaic.")
             photomosaic_tile_size = choose_photomosaic_tile_size(
-                photomosaic_source, len(crops), args.photomosaic_tile_size
+                photomosaic_source, len(crops), args.photomosaic_tile_size,
+                use_minimum_without_prompt=args.auto_photomosaic_tile_size,
             )
             if photomosaic_tile_size is None:
                 print("Photomosaic cancelled; no output was written.")
@@ -814,7 +863,7 @@ def main() -> int:
 
         if args.save_crops:
             crop_directory = Path.cwd() / "_crops"
-            save_crops(crops, crop_directory)
+            save_crops(crops, crop_directory, person_name)
             print(f"Saved individual face crops to {crop_directory}", flush=True)
 
         if args.mode == "contact-sheet":

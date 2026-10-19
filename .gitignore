@@ -40,6 +40,7 @@ env/
 
 # Generated face crops and cache
 _crops/
+data/
 
 # Local/editor files
 .DS_Store

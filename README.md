@@ -33,6 +33,43 @@ export IMMICH_API_KEY
 
 Alternatively, pass `--api-key YOUR_KEY` to the script.
 
+## Run the browser app with Docker
+
+The browser app lets you choose a person and configure the same output options as the command-line tool. It runs the existing script in the container, shows job progress, and displays the generated image with a download link.
+
+From the project directory, start the container:
+
+```sh
+docker compose up --build
+```
+
+Open [http://localhost:8080](http://localhost:8080), enter the URL of your [Immich](https://immich.app/) server, and click **Load people**. Select a person, choose contact sheet, collage, or photomosaic, set the options, and click **Create image**. Photomosaic mode also asks you to upload its target image.
+
+Enter an API key in the form, or set `IMMICH_API_KEY` in your shell before starting Docker Compose. You can set `IMMICH_BASE_URL` to prefill the server URL. For example:
+
+```sh
+export IMMICH_BASE_URL="http://<your-immich-server-ip>:2283"
+read -s "IMMICH_API_KEY?Paste your API key: "
+echo
+export IMMICH_API_KEY
+docker compose up --build
+```
+
+The API key entered in the form is sent to the container backend and is not saved to disk. Generated images, uploaded photomosaic targets, saved crops, and the reusable crop cache are stored in the `face-sheet-data` Docker volume. Docker Compose publishes the app on `localhost` only by default. Keep it on a trusted machine; add authentication and HTTPS before exposing it to other devices or the internet.
+
+To stop the app, press **Ctrl+C** in the foreground terminal or run `docker compose down` in another terminal. The named volume remains so the crop cache is reused when you start it again.
+
+## List people, birthdays, and featured photos
+
+Run `list_immich_people.py` to write a Markdown table containing every Immich person, the saved birthday (if any), and a link to the person's featured thumbnail. The API key is used to list people; the photo links point to Immich's authenticated person-thumbnail endpoint.
+
+```sh
+python3 list_immich_people.py \
+  --base-url "http://<your-immich-server-ip>:2283"
+```
+
+By default, the script writes `immich_people_birthdays.md` in the current directory. To create a CSV instead, pass `--format csv`; use `--output PATH` to choose another output file. The script reads from Immich and does not update people or photos.
+
 ## Run it
 
 From this directory, run:
@@ -53,6 +90,7 @@ If that file already exists, the script asks whether to overwrite it. If you dec
 Before making requests to [Immich](https://immich.app/), the script prints the effective run settings, including faces per row, face size, spacing, maximum faces, and whether metadata is included. It never prints the API key.
 The script automatically caches face crops in `_crops/cache/` under your current working directory. Later runs for the same [Immich](https://immich.app/) server, person, asset, and face rectangle reuse those crops and skip downloading their preview images. The script still queries [Immich](https://immich.app/) for the person, assets, and face rectangles. The cache is created even when you do not pass `--save-crops`.
 Pass `--force-fetch` to ignore cached crops for the current run, fetch fresh preview images from [Immich](https://immich.app/), and replace the cache entries. Use this if a cached crop is missing, damaged, or out of date. Pass `--save-crops` if you also want a numbered, easy-to-browse copy of the selected crops directly in `_crops/`; this is separate from the automatic cache.
+Saved crop and cache filenames start with a lowercase, filesystem-safe version of the selected person's name. For example, crops use `tiago_0001.jpg`, and cache entries use `tiago_<hash>.jpg`. If a crop filename already exists, a number is added, such as `tiago_0001_2.jpg`. Existing hash-only cache files are renamed with the person's name when reused.
 Numbered crops saved by older versions do not record which [Immich](https://immich.app/) asset and face they came from, so the script cannot safely match them to a person. The first run after upgrading may fetch those previews once to populate the new cache.
 In collage mode, the script preserves each crop's proportions and uses the configured face size, faces per row, and spacing. In photomosaic mode, provide a target image with `--photomosaic-image PATH`; the script fills the target with square face tiles selected by average color. The target image is only read and is not modified. Set tile size with `--photomosaic-tile-size`. If you omit it, the script calculates the smallest size that keeps the target's tile count within the number of available face crops, then prompts you to accept it or enter another size. Smaller tiles create more detail and may repeat face crops.
 Choose one output mode with `--mode`: `contact-sheet` (the default), `collage`, or `photomosaic`. Each run writes only the selected output to `--output`. A photomosaic also requires `--photomosaic-image PATH` for its target image. The script checks contact-sheet dimensions before downloading face previews and before writing. If the sheet would exceed Pillow's 65,500-pixel limit, it suggests settings calculated from the actual number of face crops, including the resulting dimensions.
@@ -81,13 +119,15 @@ These options apply to all three modes: `--base-url`, `--person-name`, `--api-ke
 | Option | Description | Default |
 | --- | --- | --- |
 | `--base-url URL` | [Immich](https://immich.app/) server URL, without `/api`. | Required |
-| `--person-name NAME` | Person name to look up in [Immich](https://immich.app/). Similar matches trigger a selection prompt. | Required |
+| `--person-name NAME` | Person name to look up in [Immich](https://immich.app/). Similar matches trigger a selection prompt. Use `--person-id` to select directly. | One of name or ID |
+| `--person-id ID` | Select a specific person by Immich ID, avoiding the similar-name prompt. | One of name or ID |
 | `--api-key KEY` | [Immich](https://immich.app/) API key. `IMMICH_API_KEY` is used when this option is omitted. | Environment variable |
 | `--mode TYPE` | Output type: `contact-sheet`, `collage`, or `photomosaic`. | `contact-sheet` |
 | `--output PATH` | Output JPEG path for the selected mode. | `face-sheet.jpg`, `face-collage.jpg`, or `face-photomosaic.jpg`, based on mode |
 | `--faces-per-row N` | Number of face crops on each row. `--columns` is an alias. | `10` |
 | `--face-size PIXELS` | Width and height of each square face tile in contact-sheet or collage mode. `--tile-size` is an alias. | `112` |
 | `--photomosaic-tile-size PIXELS` | Width and height of each square photomosaic tile. If omitted, calculate a minimum based on the number of face crops and prompt for a size. | Prompt |
+| `--auto-photomosaic-tile-size` | Use the calculated minimum photomosaic tile size without prompting. | Off |
 | `--include-metadata` | Show source filename and date below each face in contact-sheet mode. | Off |
 | `--face-spacing N` | Pixel gap between face tiles. | `0` |
 | `--save-crops` | Save each included face as a separate JPEG in `_crops/`. | Off |

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Immich Face Sheet</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">Immich utility</p>
+          <h1>Face Sheet</h1>
+          <p class="intro">Create a contact sheet, collage, or photomosaic from a person's face crops.</p>
+        </div>
+      </header>
+
+      <form id="job-form" enctype="multipart/form-data">
+        <section class="panel">
+          <h2>Immich connection</h2>
+          <div class="field-grid">
+            <label class="field field-wide" for="base-url">
+              <span>Immich server URL</span>
+              <input id="base-url" name="base_url" type="url" placeholder="http://immich:2283" value="{{ default_base_url }}" required>
+              <small>Use the address that the container can reach. Do not add <code>/api</code>.</small>
+            </label>
+            <label class="field field-wide" for="api-key">
+              <span>API key</span>
+              <input id="api-key" name="api_key" type="password" autocomplete="off" placeholder="{% if api_key_configured %}Leave blank to use the container's IMMICH_API_KEY{% else %}Paste an Immich API key{% endif %}">
+              <small>The key is sent to this app's backend and is not saved to disk.</small>
+            </label>
+          </div>
+          <div class="person-picker">
+            <button id="load-people" type="button" class="button secondary">Load people</button>
+            <label class="field person-field" for="person-id">
+              <span>Person</span>
+              <select id="person-id" name="person_id" required disabled>
+                <option value="">Load people first</option>
+              </select>
+              <input id="person-name" name="person_name" type="hidden">
+            </label>
+          </div>
+          <p id="people-message" class="message" role="status"></p>
+        </section>
+
+        <section class="panel">
+          <h2>Output</h2>
+          <div class="field-grid">
+            <label class="field" for="mode">
+              <span>Mode</span>
+              <select id="mode" name="mode">
+                <option value="contact-sheet">Contact sheet</option>
+                <option value="collage">Collage</option>
+                <option value="photomosaic">Photomosaic</option>
+              </select>
+            </label>
+            <label class="field" for="output-name">
+              <span>Output filename</span>
+              <input id="output-name" name="output_name" type="text" placeholder="person_faces.jpg" maxlength="104">
+              <small>Use a .jpg or .jpeg filename. Leave blank to choose one automatically.</small>
+            </label>
+          </div>
+
+          <div id="layout-options" class="field-grid options-block">
+            <label class="field" for="faces-per-row">
+              <span>Faces per row</span>
+              <input id="faces-per-row" name="faces_per_row" type="number" min="1" max="100" value="10">
+            </label>
+            <label class="field" for="face-size">
+              <span>Face size (pixels)</span>
+              <input id="face-size" name="face_size" type="number" min="32" max="2000" value="112">
+            </label>
+          </div>
+
+          <div id="photomosaic-options" class="field-grid options-block" hidden>
+            <label class="field" for="photomosaic-tile-size">
+              <span>Photomosaic tile size (pixels)</span>
+              <input id="photomosaic-tile-size" name="photomosaic_tile_size" type="number" min="1" max="2000" placeholder="Choose automatically">
+              <small>Smaller tiles add detail. Leave blank to use the script's recommended minimum.</small>
+            </label>
+            <label class="field field-wide" for="photomosaic-image">
+              <span>Target image</span>
+              <input id="photomosaic-image" name="photomosaic_image" type="file" accept="image/*">
+              <small>Maximum upload size: 64 MB.</small>
+            </label>
+          </div>
+
+          <div class="field-grid options-block">
+            <label class="field" for="face-spacing">
+              <span>Space between faces (pixels)</span>
+              <input id="face-spacing" name="face_spacing" type="number" min="0" max="1000" value="0">
+            </label>
+            <label class="field" for="max-faces">
+              <span>Maximum faces</span>
+              <input id="max-faces" name="max_faces" type="number" min="1" max="1000000" placeholder="All faces">
+            </label>
+            <label class="field" for="workers">
+              <span>Concurrent requests</span>
+              <input id="workers" name="workers" type="number" min="1" max="32" value="6">
+            </label>
+          </div>
+
+          <div class="checks">
+            <label id="metadata-option" class="check-option">
+              <input name="include_metadata" type="checkbox">
+              <span>Include filenames and dates (contact sheet only)</span>
+            </label>
+            <label class="check-option">
+              <input name="save_crops" type="checkbox">
+              <span>Save individual crops in the persistent data volume</span>
+            </label>
+            <label class="check-option">
+              <input name="force_fetch" type="checkbox">
+              <span>Fetch previews again instead of reusing cached crops</span>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="create-button" class="button primary" type="submit" disabled>Create image</button>
+            <span id="job-message" class="message" role="status"></span>
+          </div>
+        </section>
+      </form>
+
+      <section id="result-panel" class="panel result-panel" hidden>
+        <div class="result-heading">
+          <div>
+            <h2 id="result-title">Processing</h2>
+            <p id="job-status" class="message" role="status"></p>
+          </div>
+          <a id="download-link" class="button secondary" href="#" hidden>Download image</a>
+        </div>
+        <div id="image-wrap" class="image-wrap" hidden>
+          <img id="result-image" alt="Generated face sheet output">
+        </div>
+        <details class="job-log" open>
+          <summary>Job progress</summary>
+          <pre id="job-log"></pre>
+        </details>
+      </section>
+
+      <footer>
+        <p>Runs locally in the container and reads images from Immich. The script does not modify your Immich library.</p>
+      </footer>
+    </main>
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </body>
+</html>
