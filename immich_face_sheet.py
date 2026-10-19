@@ -661,6 +661,10 @@ def main() -> int:
         "--max-faces", type=int, default=None,
         help="Maximum face crops to include; by default include all faces found",
     )
+    parser.add_argument(
+        "--crop-preview-dir", metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--workers", type=int, default=6, help="Concurrent Immich requests (default: 6)")
     if sys.argv[1:] == ["help"]:
         parser.print_help()
@@ -786,13 +790,14 @@ def main() -> int:
         if not assets:
             raise RuntimeError("Immich returned no matching assets. Check the person ID and API key permissions.")
 
-        if args.mode == "contact-sheet":
+        if args.mode == "contact-sheet" and not args.crop_preview_dir:
             estimated_faces = min(args.max_faces, len(assets)) if args.max_faces is not None else len(assets)
             validate_sheet_dimensions(
                 estimated_faces, args.columns, args.tile_size,
                 args.face_spacing, args.include_metadata,
             )
         crops: list[tuple[Image.Image, str]] = []
+        crop_records: list[dict[str, Any]] = []
         cache_hits = 0
         errors = 0
         cache_directory = Path.cwd() / "_crops" / "cache"
@@ -812,6 +817,7 @@ def main() -> int:
 
         processed = 0
         batch_size = args.workers
+        progress_interval = max(1, len(assets) // 100)
         for start in range(0, len(assets), batch_size):
             batch = assets[start:start + batch_size]
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -822,9 +828,15 @@ def main() -> int:
                     try:
                         result = future.result()
                         for crop, was_cached, _label in result:
-                            crops.append((crop, label_for(
-                                asset, len(crops) + 1, args.include_metadata
-                            )))
+                            index = len(crops)
+                            label = label_for(asset, index + 1, args.include_metadata)
+                            crops.append((crop, label))
+                            crop_records.append({
+                                "id": index,
+                                "filename": str(asset.get("originalFileName") or asset.get("id") or "Unknown file"),
+                                "date": str(asset.get("localDateTime") or asset.get("fileCreatedAt") or ""),
+                                "label": label_for(asset, index + 1, True),
+                            })
                             cache_hits += int(was_cached)
                             if args.max_faces is not None and len(crops) >= args.max_faces:
                                 break
@@ -832,7 +844,7 @@ def main() -> int:
                         errors += 1
                         print(f"Skipped {asset.get('originalFileName') or asset['id']}: {exc}", file=sys.stderr)
                     processed += 1
-                    if processed % 100 == 0 or processed == len(assets) or (
+                    if processed % progress_interval == 0 or processed == len(assets) or (
                         args.max_faces is not None and len(crops) >= args.max_faces
                     ):
                         print(f"Processed {processed}/{len(assets)} assets; {len(crops)} face crops", flush=True)
@@ -845,6 +857,18 @@ def main() -> int:
             f"Reused {cache_hits} cached face crops; fetched {len(crops) - cache_hits} new previews.",
             flush=True,
         )
+
+        if args.crop_preview_dir:
+            if not crops:
+                raise RuntimeError("No face crops were found for the selected person.")
+            preview_directory = Path(args.crop_preview_dir).expanduser()
+            preview_directory.mkdir(parents=True, exist_ok=True)
+            for (crop, _label), record in zip(crops, crop_records):
+                crop.save(preview_directory / f"{record['id']}.jpg", format="JPEG", quality=92, optimize=True)
+            manifest_path = preview_directory / "manifest.json"
+            manifest_path.write_text(json.dumps(crop_records, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"Prepared {len(crops)} face crops for review in {preview_directory}.", flush=True)
+            return 0
 
         photomosaic_tile_size = None
         if args.mode == "photomosaic":

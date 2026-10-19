@@ -35,7 +35,7 @@ Alternatively, pass `--api-key YOUR_KEY` to the script.
 
 ## Run the browser app with Docker
 
-The browser app lets you choose a person and configure the same output options as the command-line tool. It runs the existing script in the container, shows job progress, and displays the generated image with a download link.
+The browser app lets you choose a person and configure the same output options as the command-line tool. While it fetches and crops images, a progress bar reports processed assets and face crops. Before building the contact sheet, collage, or photomosaic, it shows the fetched face crops for review. You can select or deselect individual crops, use **Select all** or **Deselect all**, and sort by date oldest-first or newest-first. All crops start selected. Only the selected crops are used for the output. The app shows job progress and provides the generated image and a download link. A **Previous runs** list keeps completed outputs available across app restarts, with file counts, storage usage, and a download and delete action for each run. **Delete all previous run data** removes stored run directories, including generated images, crop previews, and uploaded photomosaic targets, as well as saved crops and the reusable crop cache when no job is active. Active jobs and jobs awaiting crop selection are kept.
 
 From the project directory, start the container:
 
@@ -43,7 +43,7 @@ From the project directory, start the container:
 docker compose up --build
 ```
 
-Open [http://localhost:8080](http://localhost:8080), enter the URL of your [Immich](https://immich.app/) server, and click **Load people**. Select a person, choose contact sheet, collage, or photomosaic, set the options, and click **Create image**. Photomosaic mode also asks you to upload its target image.
+Open [http://localhost:8080](http://localhost:8080), enter the URL of your [Immich](https://immich.app/) server, and click **Load people**. Select a person, choose contact sheet, collage, or photomosaic, and set the options. Photomosaic mode also asks you to upload its target image. Click **Create image** to fetch and display the face crops, adjust the selection, then click **Create image from selection**.
 
 Enter an API key in the form, or set `IMMICH_API_KEY` in your shell before starting Docker Compose. You can set `IMMICH_BASE_URL` to prefill the server URL. For example:
 

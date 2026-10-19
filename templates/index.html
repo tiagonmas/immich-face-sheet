@@ -116,7 +116,7 @@
             </label>
           </div>
           <div class="actions">
-            <button id="create-button" class="button primary" type="submit" disabled>Create image</button>
+            <button id="create-button" class="button primary" type="submit" disabled>Fetch &amp; review crops</button>
             <span id="job-message" class="message" role="status"></span>
           </div>
         </section>
@@ -130,13 +130,55 @@
           </div>
           <a id="download-link" class="button secondary" href="#" hidden>Download image</a>
         </div>
+        <div id="job-progress-wrap" class="job-progress" hidden>
+          <progress id="job-progress" aria-label="Assets processed"></progress>
+          <span id="job-progress-label" class="job-progress-label" aria-live="polite">Finding assets…</span>
+        </div>
         <div id="image-wrap" class="image-wrap" hidden>
           <img id="result-image" alt="Generated face sheet output">
         </div>
+        <section id="crop-review" class="crop-review" hidden aria-labelledby="crop-review-title">
+          <div class="review-heading">
+            <div>
+              <h3 id="crop-review-title">Choose face crops</h3>
+              <p>All crops start selected. Choose which ones to use, then create your image.</p>
+            </div>
+            <span id="selection-count" class="selection-count" aria-live="polite"></span>
+          </div>
+          <div class="review-toolbar">
+            <div class="review-actions">
+              <button id="select-all" type="button" class="button secondary">Select all</button>
+              <button id="deselect-all" type="button" class="button secondary">Deselect all</button>
+            </div>
+            <label class="sort-control" for="crop-sort">
+              <span>Sort by date</span>
+              <select id="crop-sort">
+                <option value="date-asc">Oldest first</option>
+                <option value="date-desc">Newest first</option>
+              </select>
+            </label>
+          </div>
+          <div id="crop-grid" class="crop-grid" aria-live="polite"></div>
+          <div class="actions">
+            <button id="generate-selected" class="button primary" type="button" disabled>Create image from selection</button>
+          </div>
+        </section>
         <details class="job-log" open>
           <summary>Job progress</summary>
           <pre id="job-log"></pre>
         </details>
+      </section>
+
+      <section class="panel history-panel" aria-labelledby="history-title">
+        <div class="history-heading">
+          <div>
+            <h2 id="history-title">Previous runs</h2>
+            <p class="history-description">Completed images stay available in the app's data volume. Totals include each run's output, previews, and uploaded target files.</p>
+          </div>
+          <button id="delete-runs" class="button danger" type="button" disabled>Delete all previous run data</button>
+        </div>
+        <p id="history-message" class="message" role="status">Loading previous runs…</p>
+        <ul id="previous-runs-list" class="previous-runs-list" aria-live="polite"></ul>
       </section>
 
       <footer>
