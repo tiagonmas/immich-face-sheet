@@ -1,5 +1,7 @@
 # [Immich](https://immich.app/) Face Sheet
 
+![Immich Face Sheet project logo](static/images/immich-face-sheet-logo.png)
+
 This script finds an [Immich](https://immich.app/) person by name, retrieves the assets associated with that person, and crops the face rectangles [Immich](https://immich.app/) has identified. Choose one output mode: a contact sheet, a masonry collage, or a photomosaic made from a target image. It reads from [Immich](https://immich.app/) and does not change or upload any assets.
 
 Use the **browser app** in Docker for interactive crop review and selection, or run `immich_face_sheet.py` directly from the **command line** to generate an output using the script's options.

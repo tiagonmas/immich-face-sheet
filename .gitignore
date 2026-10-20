@@ -37,6 +37,7 @@ env/
 *.[aA][rR][wW]
 !assets/
 !assets/**
+!static/images/immich-face-sheet-logo.png
 
 # Generated face crops and cache
 _crops/

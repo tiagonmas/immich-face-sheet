@@ -52,8 +52,27 @@ let outputGenerationPending = false;
 let savedSettings = readSettingsCookie();
 
 function setMessage(element, message, isError = false) {
-  element.textContent = message;
+  setProjectLinkedText(element, message);
   element.classList.toggle("error", isError);
+}
+
+function setProjectLinkedText(element, value) {
+  const text = String(value ?? "");
+  const parts = text.split(/\b(Immich)\b/gi);
+  element.replaceChildren();
+  for (const part of parts) {
+    if (!/^Immich$/i.test(part)) {
+      element.append(document.createTextNode(part));
+      continue;
+    }
+    const link = document.createElement("a");
+    link.className = "project-link";
+    link.href = "https://immich.app/";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = part;
+    element.append(link);
+  }
 }
 
 function readSettingsCookie() {
@@ -258,8 +277,8 @@ async function watchJob(jobId, statusUrl) {
       const job = await response.json();
       if (!response.ok) throw new Error(job.error || "Could not read job status.");
       const logText = job.logs.join("\n");
-      fetchLogView.textContent = logText;
-      logView.textContent = logText;
+      setProjectLinkedText(fetchLogView, logText);
+      setProjectLinkedText(logView, logText);
       if (outputProgressWrap.hidden) updateFetchProgress(job);
       else fetchProgressWrap.hidden = true;
 

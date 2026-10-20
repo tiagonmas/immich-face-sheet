@@ -3,14 +3,15 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Immich Face Sheet</title>
+    <title>Face Sheet</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
   </head>
   <body>
     <main class="page">
       <header class="page-header">
-        <div>
-          <p class="eyebrow">Immich utility</p>
+        <img class="project-logo" src="{{ url_for('static', filename='images/immich-face-sheet-logo.png') }}" alt="Face Sheet project logo">
+        <div class="page-header-copy">
+          <p class="eyebrow"><a class="project-link" href="https://immich.app/" target="_blank" rel="noopener noreferrer">Immich</a> utility</p>
           <h1>Face Sheet</h1>
           <p class="intro">Create a contact sheet, collage, or photomosaic from a person's face crops.</p>
         </div>
@@ -18,16 +19,16 @@
 
       <form id="job-form" enctype="multipart/form-data">
         <section class="panel" id="connection-step">
-          <h2 class="step-heading"><span class="step-number">1</span> Immich connection</h2>
+          <h2 class="step-heading"><span class="step-number">1</span> <span><a class="project-link" href="https://immich.app/" target="_blank" rel="noopener noreferrer">Immich</a> connection</span></h2>
           <div class="field-grid">
             <label class="field field-wide" for="base-url">
-              <span>Immich server URL</span>
+              <span><a class="project-link" href="https://immich.app/" target="_blank" rel="noopener noreferrer">Immich</a> server URL</span>
               <input id="base-url" name="base_url" type="url" placeholder="http://immich:2283" value="{{ default_base_url }}" required>
               <small>Use the address that the container can reach. Do not add <code>/api</code>.</small>
             </label>
             <label class="field field-wide" for="api-key">
               <span>API key</span>
-              <input id="api-key" name="api_key" type="password" autocomplete="off" placeholder="{% if api_key_configured %}Leave blank to use the container's IMMICH_API_KEY{% else %}Paste an Immich API key{% endif %}">
+              <input id="api-key" name="api_key" type="password" autocomplete="off" placeholder="{% if api_key_configured %}Leave blank to use the container's IMMICH_API_KEY{% else %}Paste a server API key{% endif %}">
               <small>The API key is never stored. Other settings from the last run are saved in a browser cookie; uploaded target images are not.</small>
             </label>
           </div>
@@ -35,7 +36,7 @@
 
         <section class="panel" id="images-step">
           <h2 class="step-heading"><span class="step-number">2</span> Face images</h2>
-          <p class="step-description">Load people from Immich, choose a person and maximum face count, then review and select the crops to use.</p>
+          <p class="step-description">Load people from <a class="project-link" href="https://immich.app/" target="_blank" rel="noopener noreferrer">Immich</a>, choose a person and maximum face count, then review and select the crops to use.</p>
           <div class="person-picker">
             <button id="load-people" type="button" class="button secondary">Load people</button>
             <label class="field person-field" for="person-id">
@@ -87,6 +88,7 @@
                 <button id="select-all" type="button" class="button secondary">Select all shown</button>
                 <button id="deselect-all" type="button" class="button secondary">Deselect all</button>
                 <a id="download-crops" class="button secondary" href="#" download="face-crops.zip">Download all crops (.zip)</a>
+                <span class="crop-morph-note">Create a morph from these face images with <a href="https://github.com/leachiM2k/face-movie" target="_blank" rel="noopener noreferrer">Face Movie</a>.</span>
               </div>
               <label class="sort-control" for="crop-sort">
                 <span>Sort by date</span>
@@ -219,7 +221,7 @@
       </section>
 
       <footer>
-        <p>Runs locally in the container and reads images from Immich. The script does not modify your Immich library.</p>
+        <p>Runs locally in the container and reads images from <a class="project-link" href="https://immich.app/" target="_blank" rel="noopener noreferrer">Immich</a>. The script does not modify your <a class="project-link" href="https://immich.app/" target="_blank" rel="noopener noreferrer">Immich</a> library.</p>
       </footer>
     </main>
     <script src="{{ url_for('static', filename='app.js') }}" defer></script>
