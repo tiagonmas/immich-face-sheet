@@ -17,8 +17,8 @@
       </header>
 
       <form id="job-form" enctype="multipart/form-data">
-        <section class="panel">
-          <h2>Immich connection</h2>
+        <section class="panel" id="connection-step">
+          <h2 class="step-heading"><span class="step-number">1</span> Immich connection</h2>
           <div class="field-grid">
             <label class="field field-wide" for="base-url">
               <span>Immich server URL</span>
@@ -31,6 +31,11 @@
               <small>The API key is never stored. Other settings from the last run are saved in a browser cookie; uploaded target images are not.</small>
             </label>
           </div>
+        </section>
+
+        <section class="panel" id="images-step">
+          <h2 class="step-heading"><span class="step-number">2</span> Face images</h2>
+          <p class="step-description">Load people from Immich, choose a person and maximum face count, then review and select the crops to use.</p>
           <div class="person-picker">
             <button id="load-people" type="button" class="button secondary">Load people</button>
             <label class="field person-field" for="person-id">
@@ -42,10 +47,83 @@
             </label>
           </div>
           <p id="people-message" class="message" role="status"></p>
+          <div class="field-grid">
+            <label class="field" for="max-faces">
+              <span>Maximum faces</span>
+              <input id="max-faces" name="max_faces" type="number" min="1" max="1000000" placeholder="All faces">
+            </label>
+            <label class="field" for="workers">
+              <span>Concurrent requests</span>
+              <input id="workers" name="workers" type="number" min="1" max="32" value="6">
+            </label>
+            <label class="check-option">
+              <input name="force_fetch" type="checkbox">
+              <span>Fetch previews again instead of reusing cached crops</span>
+            </label>
+            <label class="check-option">
+              <input name="save_crops" type="checkbox">
+              <span>Save individual crops in the persistent data volume</span>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="create-button" class="button primary" type="button" disabled>Fetch &amp; review images</button>
+            <span id="job-message" class="message" role="status"></span>
+          </div>
+          <div id="fetch-progress-wrap" class="step-progress" hidden>
+            <progress id="fetch-progress" aria-label="Face images loaded"></progress>
+            <span id="fetch-progress-label" class="job-progress-label" aria-live="polite">Finding assets…</span>
+          </div>
+          <p id="fetch-status" class="message" role="status"></p>
+          <section id="crop-review" class="crop-review" hidden aria-labelledby="crop-review-title">
+            <div class="review-heading">
+              <div>
+                <h3 id="crop-review-title">Review face images</h3>
+                <p>All crops start selected. Choose which ones to use in the output.</p>
+              </div>
+              <span id="selection-count" class="selection-count" aria-live="polite"></span>
+            </div>
+            <div class="review-toolbar">
+              <div class="review-actions">
+                <button id="select-all" type="button" class="button secondary">Select all shown</button>
+                <button id="deselect-all" type="button" class="button secondary">Deselect all</button>
+                <a id="download-crops" class="button secondary" href="#" download="face-crops.zip">Download all crops (.zip)</a>
+              </div>
+              <label class="sort-control" for="crop-sort">
+                <span>Sort by date</span>
+                <select id="crop-sort">
+                  <option value="date-asc">Oldest first</option>
+                  <option value="date-desc">Newest first</option>
+                </select>
+              </label>
+            </div>
+            <div class="crop-filters" aria-label="Crop quality and file size filters">
+              <p class="filter-help">Crops outside the selected size or resolution are hidden and removed from the selection. Resolution is a simple detail-quality proxy.</p>
+              <label class="range-control" for="min-size-filter">
+                <span>Minimum file size <output id="min-size-value">0 KB</output></span>
+                <input id="min-size-filter" type="range" min="0" max="1024" step="1" value="0">
+              </label>
+              <label class="range-control" for="max-size-filter">
+                <span>Maximum file size <output id="max-size-value">1024 KB</output></span>
+                <input id="max-size-filter" type="range" min="0" max="1024" step="1" value="1024">
+              </label>
+              <label class="range-control" for="min-resolution-filter">
+                <span>Minimum quality (short-side resolution) <output id="min-resolution-value">Any</output></span>
+                <input id="min-resolution-filter" type="range" min="0" max="1024" step="8" value="0">
+                <small>Higher pixel resolution usually preserves more detail.</small>
+              </label>
+            </div>
+            <div id="crop-grid" class="crop-grid" aria-live="polite"></div>
+          </section>
+          <details class="job-log">
+            <summary>Image loading details</summary>
+            <pre id="fetch-log"></pre>
+          </details>
         </section>
 
-        <section class="panel">
-          <h2>Output</h2>
+        <section class="panel" id="output-settings-step">
+          <h2 class="step-heading"><span class="step-number">3</span> Output</h2>
+          <p id="output-step-hint" class="step-description">Review the loaded face images in step 2 to unlock these options.</p>
+          <fieldset id="output-settings-fields" disabled>
           <div class="field-grid">
             <label class="field" for="mode">
               <span>Mode</span>
@@ -91,14 +169,6 @@
               <span>Space between faces (pixels)</span>
               <input id="face-spacing" name="face_spacing" type="number" min="0" max="1000" value="0">
             </label>
-            <label class="field" for="max-faces">
-              <span>Maximum faces</span>
-              <input id="max-faces" name="max_faces" type="number" min="1" max="1000000" placeholder="All faces">
-            </label>
-            <label class="field" for="workers">
-              <span>Concurrent requests</span>
-              <input id="workers" name="workers" type="number" min="1" max="32" value="6">
-            </label>
           </div>
 
           <div class="checks">
@@ -106,65 +176,32 @@
               <input name="include_metadata" type="checkbox">
               <span>Include filenames and dates (contact sheet only)</span>
             </label>
-            <label class="check-option">
-              <input name="save_crops" type="checkbox">
-              <span>Save individual crops in the persistent data volume</span>
-            </label>
-            <label class="check-option">
-              <input name="force_fetch" type="checkbox">
-              <span>Fetch previews again instead of reusing cached crops</span>
-            </label>
           </div>
           <div class="actions">
-            <button id="create-button" class="button primary" type="submit" disabled>Fetch &amp; review crops</button>
-            <span id="job-message" class="message" role="status"></span>
+            <button id="generate-selected" class="button primary" type="button" disabled>Create output</button>
           </div>
+          </fieldset>
         </section>
       </form>
 
-      <section id="result-panel" class="panel result-panel" hidden>
+      <section id="result-panel" class="panel result-panel">
         <div class="result-heading">
           <div>
-            <h2 id="result-title">Processing</h2>
+            <h2 class="step-heading"><span class="step-number">4</span> <span id="result-title">Your output</span></h2>
             <p id="job-status" class="message" role="status"></p>
           </div>
           <a id="download-link" class="button secondary" href="#" hidden>Download image</a>
         </div>
-        <div id="job-progress-wrap" class="job-progress" hidden>
-          <progress id="job-progress" aria-label="Assets processed"></progress>
-          <span id="job-progress-label" class="job-progress-label" aria-live="polite">Finding assets…</span>
-        </div>
+        <p id="result-placeholder" class="step-description">Your generated image will appear here after you finish step 3.</p>
         <div id="image-wrap" class="image-wrap" hidden>
           <img id="result-image" alt="Generated face sheet output">
         </div>
-        <section id="crop-review" class="crop-review" hidden aria-labelledby="crop-review-title">
-          <div class="review-heading">
-            <div>
-              <h3 id="crop-review-title">Choose face crops</h3>
-              <p>All crops start selected. Choose which ones to use, then create your image.</p>
-            </div>
-            <span id="selection-count" class="selection-count" aria-live="polite"></span>
-          </div>
-          <div class="review-toolbar">
-            <div class="review-actions">
-              <button id="select-all" type="button" class="button secondary">Select all</button>
-              <button id="deselect-all" type="button" class="button secondary">Deselect all</button>
-            </div>
-            <label class="sort-control" for="crop-sort">
-              <span>Sort by date</span>
-              <select id="crop-sort">
-                <option value="date-asc">Oldest first</option>
-                <option value="date-desc">Newest first</option>
-              </select>
-            </label>
-          </div>
-          <div id="crop-grid" class="crop-grid" aria-live="polite"></div>
-          <div class="actions">
-            <button id="generate-selected" class="button primary" type="button" disabled>Create image from selection</button>
-          </div>
-        </section>
-        <details class="job-log" open>
-          <summary>Job progress</summary>
+        <div id="output-progress-wrap" class="step-progress" hidden>
+          <progress id="output-progress" aria-label="Output generation progress"></progress>
+          <span id="output-progress-label" class="job-progress-label" aria-live="polite">Creating output…</span>
+        </div>
+        <details id="output-log-wrap" class="job-log" open hidden>
+          <summary>Output details</summary>
           <pre id="job-log"></pre>
         </details>
       </section>
@@ -172,7 +209,7 @@
       <section class="panel history-panel" aria-labelledby="history-title">
         <div class="history-heading">
           <div>
-            <h2 id="history-title">Previous runs</h2>
+            <h2 id="history-title" class="step-heading"><span class="step-number">5</span> Previous results</h2>
             <p class="history-description">Completed images stay available in the app's data volume. Totals include each run's output, previews, and uploaded target files.</p>
           </div>
           <button id="delete-runs" class="button danger" type="button" disabled>Delete all previous run data</button>

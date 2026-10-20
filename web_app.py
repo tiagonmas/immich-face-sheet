@@ -11,9 +11,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template, request, send_file, url_for
@@ -100,14 +102,16 @@ def persist_run_metadata(job: dict[str, object]) -> None:
     metadata_path = job.get("_metadata_path")
     if not metadata_path:
         return
+    outputs = list(job.get("outputs") or [])
     payload = {
         "job_id": str(job.get("job_id") or Path(str(metadata_path)).parent.name),
         "created_at": job.get("created_at"),
         "person_name": job.get("person_name", "Person"),
         "mode": job.get("mode", "contact-sheet"),
         "output_name": job.get("output_name", ""),
-        "status": job.get("status", "unknown"),
+        "status": "complete" if outputs else job.get("status", "unknown"),
         "crop_count": job.get("crop_count"),
+        "outputs": outputs,
     }
     path = Path(str(metadata_path))
     try:
@@ -228,13 +232,23 @@ def run_generation_job(job_id: str, selected_ids: list[int]) -> None:
 
         if settings["save_crops"]:
             face_sheet.save_crops(crops, DATA_DIR / "_crops", str(settings["person_name"]))
-        set_job(
-            job_id,
-            status="complete",
-            image_url=f"/api/jobs/{job_id}/image",
-            download_url=f"/api/jobs/{job_id}/image?download=1",
-            output_name=str(settings["output_name"]),
-        )
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is not None:
+                outputs = list(job.get("outputs") or [])
+                outputs.append({
+                    "output_name": str(settings["output_name"]),
+                    "mode": str(settings["mode"]),
+                    "created_at": time.time(),
+                })
+                job.update(
+                    status="complete",
+                    image_url=f"/api/jobs/{job_id}/image",
+                    download_url=f"/api/jobs/{job_id}/image?download=1",
+                    output_name=str(settings["output_name"]),
+                    outputs=outputs,
+                )
+                persist_run_metadata(job)
     except Exception as exc:
         append_job_log(job_id, f"Could not create the selected output: {exc}")
         set_job(job_id, status="failed", error=f"Could not create the selected output: {exc}")
@@ -295,100 +309,40 @@ def create_job():
         person_name = form.get("person_name", "").strip()
         if not person_id or not person_name:
             raise ValueError("Load the Immich people list and select a person first.")
-
-        mode = form.get("mode", "contact-sheet")
-        if mode not in {"contact-sheet", "collage", "photomosaic"}:
-            raise ValueError("Choose a valid output mode.")
-        columns = positive_int(form.get("faces_per_row", "10"), "Faces per row", 10, 100)
-        face_size = positive_int(form.get("face_size", "112"), "Face size", 112, 2000)
         workers = positive_int(form.get("workers", "6"), "Workers", 6, 32)
-        spacing = int(form.get("face_spacing", "0"))
         max_faces_value = form.get("max_faces", "").strip()
         max_faces = positive_int(max_faces_value, "Maximum faces", 1, 1_000_000) if max_faces_value else None
-        if not 0 <= spacing <= 1000:
-            raise ValueError("Face spacing must be between 0 and 1000 pixels.")
-        tile_size_value = form.get("photomosaic_tile_size", "").strip()
-        mosaic_tile_size = positive_int(tile_size_value, "Photomosaic tile size", 1, 2000) if tile_size_value else None
-        output_name = form.get("output_name", "").strip()
-        if not output_name:
-            prefix = face_sheet.person_name_slug(person_name)
-            suffix = {"contact-sheet": "faces", "collage": "collage", "photomosaic": "photomosaic"}[mode]
-            output_name = f"{prefix}_{suffix}.jpg"
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|jpeg)", output_name, re.IGNORECASE):
-            raise ValueError("Output filename must be a .jpg or .jpeg filename without folders.")
-
-        target_upload = request.files.get("photomosaic_image")
-        if mode == "photomosaic" and (target_upload is None or not target_upload.filename):
-            raise ValueError("Choose a target image for photomosaic mode.")
-        if mode != "photomosaic" and target_upload and target_upload.filename:
-            raise ValueError("A target image can only be uploaded in photomosaic mode.")
     except (ValueError, TypeError) as exc:
         return jsonify(error=str(exc)), 400
 
     job_id = uuid.uuid4().hex
     job_directory = DATA_DIR / "results" / job_id
     job_directory.mkdir(parents=True, exist_ok=False)
-    output_path = job_directory / output_name
     preview_directory = job_directory / "crop-previews"
     arguments = [
         "--base-url", base_url,
         "--person-name", person_name,
         "--person-id", person_id,
-        "--mode", mode,
-        "--output", str(output_path),
-        "--faces-per-row", str(columns),
-        "--face-size", str(face_size),
-        "--face-spacing", str(spacing),
+        "--mode", "contact-sheet",
         "--workers", str(workers),
         "--crop-preview-dir", str(preview_directory),
     ]
     if max_faces is not None:
         arguments.extend(["--max-faces", str(max_faces)])
-    if form.get("include_metadata") == "on":
-        arguments.append("--include-metadata")
     if form.get("force_fetch") == "on":
         arguments.append("--force-fetch")
-    target_path = None
-    if mode == "photomosaic":
-        target_path = job_directory / "photomosaic-target"
-        assert target_upload is not None
-        target_upload.save(target_path)
-        try:
-            with Image.open(target_path) as target:
-                target.verify()
-        except Exception:
-            target_path.unlink(missing_ok=True)
-            shutil.rmtree(job_directory, ignore_errors=True)
-            return jsonify(error="The uploaded target is not a valid image."), 400
-        arguments.extend(["--photomosaic-image", str(target_path)])
-        if mosaic_tile_size is not None:
-            arguments.extend(["--photomosaic-tile-size", str(mosaic_tile_size)])
-        else:
-            arguments.append("--auto-photomosaic-tile-size")
 
     if not reserve_job(job_id, {
         "status": "queued",
         "job_id": job_id,
         "person_name": person_name,
-        "mode": mode,
-        "output_name": output_name,
+        "mode": "contact-sheet",
+        "output_name": "",
+        "outputs": [],
         "logs": [],
         "created_at": time.time(),
         "_metadata_path": str(job_directory / "run.json"),
         "_preview_directory": str(preview_directory),
-        "_generation_settings": {
-            "mode": mode,
-            "person_name": person_name,
-            "output_path": str(output_path),
-            "output_name": output_name,
-            "columns": columns,
-            "tile_size": face_size,
-            "spacing": spacing,
-            "include_metadata": form.get("include_metadata") == "on",
-            "save_crops": form.get("save_crops") == "on",
-            "target_path": str(target_path) if target_path else None,
-            "mosaic_tile_size": mosaic_tile_size,
-        },
     }):
         shutil.rmtree(job_directory, ignore_errors=True)
         return jsonify(error="A job is already running. Wait for it to finish and try again."), 429
@@ -422,15 +376,77 @@ def job_crops(job_id: str):
         records = json.loads((preview_directory / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return jsonify(error="The crop review is no longer available."), 404
-    return jsonify(crops=[
-        {
-            "id": int(record["id"]),
+    crops = []
+    for record in records:
+        crop_id = int(record["id"])
+        crop_path = preview_directory / f"{crop_id}.jpg"
+        try:
+            file_size = crop_path.stat().st_size
+            with Image.open(crop_path) as image:
+                width, height = image.size
+        except (OSError, ValueError):
+            return jsonify(error="A crop preview is missing or unreadable."), 404
+        crops.append({
+            "id": crop_id,
             "filename": str(record.get("filename") or "Unknown file"),
             "date": str(record.get("date") or ""),
-            "image_url": url_for("job_crop_image", job_id=job_id, crop_id=int(record["id"])),
-        }
-        for record in records
-    ])
+            "file_size_bytes": file_size,
+            "width": width,
+            "height": height,
+            "image_url": url_for("job_crop_image", job_id=job_id, crop_id=crop_id),
+        })
+    return jsonify(crops=crops)
+
+
+def crop_archive_response(preview_directory: Path):
+    try:
+        records = json.loads((preview_directory / "manifest.json").read_text(encoding="utf-8"))
+        temporary = tempfile.NamedTemporaryFile(prefix="face-crops-", suffix=".zip", delete=False)
+        archive_path = Path(temporary.name)
+        temporary.close()
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for record in records:
+                crop_id = int(record["id"])
+                crop_path = preview_directory / f"{crop_id}.jpg"
+                if not crop_path.is_file():
+                    raise OSError("A crop preview is missing.")
+                original_name = Path(str(record.get("filename") or "crop")).name
+                safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(original_name).stem).strip("._-") or "crop"
+                archive.write(crop_path, arcname=f"{crop_id + 1:06d}_{safe_stem}.jpg")
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        if "archive_path" in locals():
+            archive_path.unlink(missing_ok=True)
+        return jsonify(error="Could not prepare the face crop archive."), 404
+
+    response = send_file(
+        archive_path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="face-crops.zip",
+        conditional=True,
+    )
+    response.call_on_close(lambda: archive_path.unlink(missing_ok=True))
+    return response
+
+
+@app.get("/api/jobs/<job_id>/crops.zip")
+def download_job_crops(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None or job.get("status") not in {"review", "queued", "generating", "complete"}:
+            return jsonify(error="These face crops are not available."), 404
+        preview_directory = Path(str(job["_preview_directory"]))
+    return crop_archive_response(preview_directory)
+
+
+@app.get("/api/runs/<job_id>/crops.zip")
+def download_previous_run_crops(job_id: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        return jsonify(error="Run not found."), 404
+    preview_directory = DATA_DIR / "results" / job_id / "crop-previews"
+    if not (preview_directory / "manifest.json").is_file():
+        return jsonify(error="This run has no saved crop previews."), 404
+    return crop_archive_response(preview_directory)
 
 
 @app.get("/api/jobs/<job_id>/crops/<int:crop_id>")
@@ -450,19 +466,22 @@ def job_crop_image(job_id: str, crop_id: int):
 
 @app.post("/api/jobs/<job_id>/generate")
 def generate_selected(job_id: str):
-    payload = request.get_json(silent=True) or {}
-    selected = payload.get("selected_ids")
+    try:
+        selected = json.loads(request.form.get("selected_ids", "null"))
+    except json.JSONDecodeError:
+        selected = None
     if not isinstance(selected, list) or not selected or any(
         isinstance(value, bool) or not isinstance(value, int) for value in selected
     ):
         return jsonify(error="Select at least one crop to continue."), 400
     if len(set(selected)) != len(selected):
         return jsonify(error="The selection contains duplicate crops."), 400
+
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
             return jsonify(error="This job was not found. It may have expired or the app restarted."), 404
-        if job.get("status") != "review":
+        if job.get("status") not in {"review", "complete", "failed"}:
             return jsonify(error="This crop review has already been submitted."), 409
         preview_directory = Path(str(job["_preview_directory"]))
     try:
@@ -472,11 +491,93 @@ def generate_selected(job_id: str):
         return jsonify(error="The crop review is no longer available."), 404
     if any(crop_id not in available for crop_id in selected):
         return jsonify(error="The selection contains a crop that is no longer available."), 400
+
+    form = request.form
+    target_path = None
+    try:
+        mode = form.get("mode", "contact-sheet")
+        if mode not in {"contact-sheet", "collage", "photomosaic"}:
+            raise ValueError("Choose a valid output mode.")
+        columns = positive_int(form.get("faces_per_row", "10"), "Faces per row", 10, 100)
+        face_size = positive_int(form.get("face_size", "112"), "Face size", 112, 2000)
+        spacing = int(form.get("face_spacing", "0"))
+        if not 0 <= spacing <= 1000:
+            raise ValueError("Face spacing must be between 0 and 1000 pixels.")
+        tile_size_value = form.get("photomosaic_tile_size", "").strip()
+        mosaic_tile_size = positive_int(tile_size_value, "Photomosaic tile size", 1, 2000) if tile_size_value else None
+        output_name = form.get("output_name", "").strip()
+        if not output_name:
+            prefix = face_sheet.person_name_slug(str(job["person_name"]))
+            suffix = {"contact-sheet": "faces", "collage": "collage", "photomosaic": "photomosaic"}[mode]
+            output_name = f"{prefix}_{suffix}.jpg"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|jpeg)", output_name, re.IGNORECASE):
+            raise ValueError("Output filename must be a .jpg or .jpeg filename without folders.")
+
+        job_directory = preview_directory.parent
+        used_names = {str(output.get("output_name") or "") for output in job.get("outputs", [])}
+        output_path = job_directory / output_name
+        if output_name in used_names or output_path.exists():
+            suffix = Path(output_name).suffix
+            stem = Path(output_name).stem
+            index = 2
+            while True:
+                marker = f"_{index}"
+                unique_stem = f"{stem[:100 - len(marker)].rstrip('._-')}{marker}"
+                candidate_name = f"{unique_stem}{suffix}"
+                candidate_path = job_directory / candidate_name
+                if candidate_name not in used_names and not candidate_path.exists():
+                    output_name = candidate_name
+                    output_path = candidate_path
+                    break
+                index += 1
+        target_upload = request.files.get("photomosaic_image")
+        if mode == "photomosaic":
+            if target_upload is None or not target_upload.filename:
+                raise ValueError("Choose a target image for photomosaic mode.")
+            target_path = job_directory / f"{Path(output_name).stem}-target"
+            target_upload.save(target_path)
+            try:
+                with Image.open(target_path) as target:
+                    target.verify()
+            except Exception as exc:
+                target_path.unlink(missing_ok=True)
+                target_path = None
+                raise ValueError("The uploaded target is not a valid image.") from exc
+        elif target_upload and target_upload.filename:
+            raise ValueError("A target image can only be uploaded in photomosaic mode.")
+    except (ValueError, TypeError) as exc:
+        if target_path is not None:
+            target_path.unlink(missing_ok=True)
+        return jsonify(error=str(exc)), 400
+
+    settings = {
+        "mode": mode,
+        "person_name": str(job["person_name"]),
+        "output_path": str(output_path),
+        "output_name": output_name,
+        "columns": columns,
+        "tile_size": face_size,
+        "spacing": spacing,
+        "include_metadata": form.get("include_metadata") == "on" and mode == "contact-sheet",
+        "save_crops": form.get("save_crops") == "on",
+        "target_path": str(target_path) if target_path else None,
+        "mosaic_tile_size": mosaic_tile_size,
+    }
+    conflict = False
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-        if job is None or job.get("status") != "review":
-            return jsonify(error="This crop review has already been submitted."), 409
-        job["status"] = "queued"
+        if job is None or job.get("status") not in {"review", "complete", "failed"}:
+            conflict = True
+        else:
+            job["_generation_settings"] = settings
+            job["mode"] = mode
+            job["output_name"] = output_name
+            job["status"] = "queued"
+            persist_run_metadata(job)
+    if conflict:
+        if target_path is not None:
+            target_path.unlink(missing_ok=True)
+        return jsonify(error="This crop review has already been submitted."), 409
     JOB_POOL.submit(run_generation_job, job_id, selected)
     return jsonify(status="queued"), 202
 
@@ -530,24 +631,37 @@ def previous_run_records() -> list[dict[str, object]]:
         try:
             if metadata_path.is_file():
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                output_name = str(metadata.get("output_name") or "")
-                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|jpeg)", output_name, re.IGNORECASE):
+                if metadata.get("status") != "complete":
                     continue
-                output_path = directory / output_name
-                if metadata.get("status") != "complete" or not output_name or not output_path.is_file():
-                    continue
+                outputs = metadata.get("outputs")
+                if not isinstance(outputs, list) or not outputs:
+                    outputs = [{
+                        "output_name": metadata.get("output_name"),
+                        "mode": metadata.get("mode"),
+                        "created_at": metadata.get("created_at"),
+                    }]
                 created_at = metadata.get("created_at") or directory.stat().st_mtime
                 file_count, size_bytes = run_directory_usage(directory)
-                records.append({
-                    "job_id": directory.name,
-                    "created_at": created_at,
-                    "person_name": str(metadata.get("person_name") or "Person"),
-                    "mode": str(metadata.get("mode") or "image"),
-                    "output_name": output_name,
-                    "file_count": file_count,
-                    "size_bytes": size_bytes,
-                    "download_url": url_for("previous_run_download", job_id=directory.name),
-                })
+                crop_manifest = directory / "crop-previews" / "manifest.json"
+                for output in outputs:
+                    if not isinstance(output, dict):
+                        continue
+                    output_name = str(output.get("output_name") or "")
+                    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|jpeg)", output_name, re.IGNORECASE):
+                        continue
+                    if not (directory / output_name).is_file():
+                        continue
+                    records.append({
+                        "job_id": directory.name,
+                        "created_at": output.get("created_at") or created_at,
+                        "person_name": str(metadata.get("person_name") or "Person"),
+                        "mode": str(output.get("mode") or metadata.get("mode") or "image"),
+                        "output_name": output_name,
+                        "file_count": file_count,
+                        "size_bytes": size_bytes,
+                        "download_url": url_for("previous_run_download", job_id=directory.name, output=output_name),
+                        "crop_download_url": url_for("download_previous_run_crops", job_id=directory.name) if crop_manifest.is_file() else None,
+                    })
                 continue
             # Keep showing completed images made before run-history metadata was added.
             images = sorted(
@@ -555,6 +669,7 @@ def previous_run_records() -> list[dict[str, object]]:
                 if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg"}
             )
             file_count, size_bytes = run_directory_usage(directory)
+            crop_manifest = directory / "crop-previews" / "manifest.json"
             for output_path in images:
                 stem = output_path.stem
                 if stem.endswith("_photomosaic"):
@@ -573,7 +688,8 @@ def previous_run_records() -> list[dict[str, object]]:
                     "output_name": output_path.name,
                     "file_count": file_count,
                     "size_bytes": size_bytes,
-                    "download_url": url_for("previous_run_download", job_id=directory.name),
+                    "download_url": url_for("previous_run_download", job_id=directory.name, output=output_path.name),
+                    "crop_download_url": url_for("download_previous_run_crops", job_id=directory.name) if crop_manifest.is_file() else None,
                 })
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             continue
@@ -603,7 +719,16 @@ def previous_run_download(job_id: str):
         if metadata_path.is_file():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if metadata.get("status") == "complete":
-                name = str(metadata.get("output_name") or "")
+                requested_name = request.args.get("output", "").strip()
+                outputs = metadata.get("outputs")
+                if isinstance(outputs, list) and outputs:
+                    valid_names = [
+                        str(output.get("output_name") or "")
+                        for output in outputs if isinstance(output, dict)
+                    ]
+                    name = requested_name if requested_name in valid_names else (valid_names[-1] if not requested_name and valid_names else "")
+                else:
+                    name = requested_name or str(metadata.get("output_name") or "")
                 if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|jpeg)", name, re.IGNORECASE):
                     output_path = directory / name
         else:
@@ -611,7 +736,8 @@ def previous_run_download(job_id: str):
                 path for path in directory.iterdir()
                 if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg"}
             ) if directory.is_dir() else []
-            output_path = images[0] if images else None
+            requested_name = request.args.get("output", "").strip()
+            output_path = next((path for path in images if path.name == requested_name), None) if requested_name else (images[0] if images else None)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         output_path = None
     if output_path is None or not output_path.is_file() or output_path.parent != directory:
@@ -630,18 +756,55 @@ def delete_previous_run(job_id: str):
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
         return jsonify(error="Run not found."), 404
     directory = DATA_DIR / "results" / job_id
+    payload = request.get_json(silent=True) or {}
+    output_name = str(payload.get("output_name") or "").strip()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is not None and job.get("status") in {"queued", "running", "generating", "review"}:
             return jsonify(error="This run is still active and cannot be deleted yet."), 409
         if not directory.is_dir():
             return jsonify(error="Run not found."), 404
+        if output_name:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|jpeg)", output_name, re.IGNORECASE):
+                return jsonify(error="Output not found."), 404
+            metadata_path = directory / "run.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+                outputs = metadata.get("outputs")
+                if isinstance(outputs, list) and outputs:
+                    remaining = [
+                        item for item in outputs
+                        if isinstance(item, dict) and str(item.get("output_name") or "") != output_name
+                    ]
+                    if len(remaining) == len(outputs):
+                        return jsonify(error="Run result not found."), 404
+                    (directory / output_name).unlink(missing_ok=True)
+                    (directory / f"{Path(output_name).stem}-target").unlink(missing_ok=True)
+                    if remaining:
+                        metadata["outputs"] = remaining
+                        latest = remaining[-1]
+                        metadata["output_name"] = latest.get("output_name", "")
+                        metadata["mode"] = latest.get("mode", metadata.get("mode", "contact-sheet"))
+                        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+                        if job is not None:
+                            job["outputs"] = remaining
+                            job["output_name"] = metadata["output_name"]
+                            job["mode"] = metadata["mode"]
+                            job["status"] = "complete"
+                            persist_run_metadata(job)
+                        return jsonify(deleted=True, deleted_output=output_name, deleted_run=False)
+                else:
+                    existing_name = str(metadata.get("output_name") or "")
+                    if existing_name and existing_name != output_name:
+                        return jsonify(error="Run result not found."), 404
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                return jsonify(error="Could not read this run's metadata."), 500
         try:
             shutil.rmtree(directory)
         except OSError:
             return jsonify(error="Could not delete this run's stored files."), 500
         JOBS.pop(job_id, None)
-    return jsonify(deleted=True)
+    return jsonify(deleted=True, deleted_output=output_name or None, deleted_run=True)
 
 
 @app.post("/api/runs/delete-all")
