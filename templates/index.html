@@ -28,7 +28,7 @@
             <label class="field field-wide" for="api-key">
               <span>API key</span>
               <input id="api-key" name="api_key" type="password" autocomplete="off" placeholder="{% if api_key_configured %}Leave blank to use the container's IMMICH_API_KEY{% else %}Paste an Immich API key{% endif %}">
-              <small>The key is sent to this app's backend and is not saved to disk.</small>
+              <small>The API key is never stored. Other settings from the last run are saved in a browser cookie; uploaded target images are not.</small>
             </label>
           </div>
           <div class="person-picker">

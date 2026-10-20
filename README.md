@@ -2,6 +2,8 @@
 
 This script finds an [Immich](https://immich.app/) person by name, retrieves the assets associated with that person, and crops the face rectangles [Immich](https://immich.app/) has identified. Choose one output mode: a contact sheet, a masonry collage, or a photomosaic made from a target image. It reads from [Immich](https://immich.app/) and does not change or upload any assets.
 
+Use the **browser app** in Docker for interactive crop review and selection, or run `immich_face_sheet.py` directly from the **command line** to generate an output using the script's options.
+
 If several people have similar names, the script lists the matches and asks you to choose one. Face crops are requested from [Immich](https://immich.app/)'s preview images, so the resulting faces may be lower resolution than the original photos.
 
 ## Requirements
@@ -35,7 +37,9 @@ Alternatively, pass `--api-key YOUR_KEY` to the script.
 
 ## Run the browser app with Docker
 
-The browser app lets you choose a person and configure the same output options as the command-line tool. While it fetches and crops images, a progress bar reports processed assets and face crops. Before building the contact sheet, collage, or photomosaic, it shows the fetched face crops for review. You can select or deselect individual crops, use **Select all** or **Deselect all**, and sort by date oldest-first or newest-first. All crops start selected. Only the selected crops are used for the output. The app shows job progress and provides the generated image and a download link. A **Previous runs** list keeps completed outputs available across app restarts, with file counts, storage usage, and a download and delete action for each run. **Delete all previous run data** removes stored run directories, including generated images, crop previews, and uploaded photomosaic targets, as well as saved crops and the reusable crop cache when no job is active. Active jobs and jobs awaiting crop selection are kept.
+The browser app lets you choose a person and configure the same output options as the command-line tool. It saves the last submitted options and person selection in a browser cookie so they can be restored on the next visit; the API key and uploaded photomosaic target are not saved. While it fetches and crops images, a progress bar reports processed assets and face crops. Before building the contact sheet, collage, or photomosaic, it shows the fetched face crops for review. You can select or deselect individual crops, use **Select all** or **Deselect all**, and sort by date oldest-first or newest-first. All crops start selected. Only the selected crops are used for the output. The app shows job progress and provides the generated image and a download link. A **Previous runs** list keeps completed outputs available across app restarts, with file counts, storage usage, and a download and delete action for each run. **Delete all previous run data** removes stored run directories, including generated images, crop previews, and uploaded photomosaic targets, as well as saved crops and the reusable crop cache when no job is active. Active jobs and jobs awaiting crop selection are kept.
+
+![Face Sheet browser app showing Immich connection and output settings](assets/facesheet.png)
 
 From the project directory, start the container:
 
@@ -70,7 +74,7 @@ python3 list_immich_people.py \
 
 By default, the script writes `immich_people_birthdays.md` in the current directory. To create a CSV instead, pass `--format csv`; use `--output PATH` to choose another output file. The script reads from Immich and does not update people or photos.
 
-## Run it
+## Run from the command line
 
 From this directory, run:
 

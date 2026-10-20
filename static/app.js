@@ -26,14 +26,75 @@ const generateSelectedButton = document.querySelector("#generate-selected");
 const historyMessage = document.querySelector("#history-message");
 const previousRunsList = document.querySelector("#previous-runs-list");
 const deleteRunsButton = document.querySelector("#delete-runs");
+const settingsCookieName = "immich_face_sheet_settings";
+const cookieMaxAge = 60 * 60 * 24 * 365;
 let reviewJob = null;
 let reviewStatusUrl = null;
 let cropItems = [];
 let selectedCropIds = new Set();
+let savedSettings = readSettingsCookie();
 
 function setMessage(element, message, isError = false) {
   element.textContent = message;
   element.classList.toggle("error", isError);
+}
+
+function readSettingsCookie() {
+  const prefix = `${settingsCookieName}=`;
+  const cookie = document.cookie.split(";").map((value) => value.trim()).find((value) => value.startsWith(prefix));
+  if (!cookie) return null;
+  try {
+    const value = JSON.parse(decodeURIComponent(cookie.slice(prefix.length)));
+    return value && typeof value === "object" ? value : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function restoreLastExecutionSettings() {
+  if (!savedSettings) return;
+  const textFields = [
+    "base_url", "person_id", "person_name", "output_name", "faces_per_row",
+    "face_size", "photomosaic_tile_size", "face_spacing", "max_faces", "workers",
+  ];
+  for (const name of textFields) {
+    const field = form.elements.namedItem(name);
+    if (field && Object.hasOwn(savedSettings, name)) field.value = savedSettings[name];
+  }
+  if (["contact-sheet", "collage", "photomosaic"].includes(savedSettings.mode)) {
+    modeSelect.value = savedSettings.mode;
+  }
+  for (const name of ["include_metadata", "save_crops", "force_fetch"]) {
+    const checkbox = form.elements.namedItem(name);
+    checkbox.checked = savedSettings[name] === true;
+  }
+}
+
+function saveLastExecutionSettings() {
+  // This allowlist deliberately omits api_key and the uploaded photomosaic file.
+  const settings = {
+    base_url: baseUrl.value,
+    person_id: personSelect.value,
+    person_name: personName.value,
+    mode: modeSelect.value,
+    output_name: form.elements.namedItem("output_name").value,
+    faces_per_row: form.elements.namedItem("faces_per_row").value,
+    face_size: form.elements.namedItem("face_size").value,
+    photomosaic_tile_size: form.elements.namedItem("photomosaic_tile_size").value,
+    face_spacing: form.elements.namedItem("face_spacing").value,
+    max_faces: form.elements.namedItem("max_faces").value,
+    workers: form.elements.namedItem("workers").value,
+    include_metadata: form.elements.namedItem("include_metadata").checked,
+    save_crops: form.elements.namedItem("save_crops").checked,
+    force_fetch: form.elements.namedItem("force_fetch").checked,
+  };
+  try {
+    const secure = window.location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = `${settingsCookieName}=${encodeURIComponent(JSON.stringify(settings))}; Max-Age=${cookieMaxAge}; Path=/; SameSite=Lax${secure}`;
+    savedSettings = settings;
+  } catch (_error) {
+    // Cookie storage may be disabled by the browser; do not block the run.
+  }
 }
 
 function formatFileSize(bytes) {
@@ -99,7 +160,12 @@ async function loadPeople() {
       option.dataset.name = person.name;
       personSelect.add(option);
     }
+    if (savedSettings?.base_url === baseUrl.value && savedSettings.person_id) {
+      personSelect.value = savedSettings.person_id;
+      personName.value = personSelect.selectedOptions[0]?.dataset.name || "";
+    }
     personSelect.disabled = false;
+    createButton.disabled = !personSelect.value;
     setMessage(peopleMessage, `Loaded ${result.people.length} named people.`);
   } catch (error) {
     personSelect.replaceChildren(new Option("Load people first", ""));
@@ -117,6 +183,7 @@ personSelect.addEventListener("change", () => {
 
 loadPeopleButton.addEventListener("click", loadPeople);
 modeSelect.addEventListener("change", updateModeOptions);
+restoreLastExecutionSettings();
 updateModeOptions();
 loadPreviousRuns();
 
@@ -376,6 +443,7 @@ generateSelectedButton.addEventListener("click", async () => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  saveLastExecutionSettings();
   setMessage(jobMessage, "Starting job…");
   createButton.disabled = true;
   resultPanel.hidden = false;
